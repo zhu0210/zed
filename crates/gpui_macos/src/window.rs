@@ -4,6 +4,8 @@ use crate::{
     kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
     ns_string, renderer,
 };
+#[cfg(feature = "wgpu-renderer")]
+use crate::wgpu_backend::wgpu_utils::RawWindow;
 #[cfg(any(test, feature = "test-support"))]
 use anyhow::Result;
 use block::ConcreteBlock;
@@ -33,7 +35,11 @@ use gpui::{
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind,
     WindowParams, point, px, size,
 };
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(feature = "wgpu-renderer")]
+use gpui::DevicePixels;
+#[cfg(feature = "wgpu-renderer")]
+use gpui_wgpu::WgpuSurfaceConfig;
+#[cfg(all(any(test, feature = "test-support"), not(feature = "wgpu-renderer")))]
 use image::RgbaImage;
 
 use core_foundation::base::{CFRelease, CFTypeRef};
@@ -102,6 +108,7 @@ const NSTrackingActiveAlways: NSUInteger = 0x80;
 const NSTrackingInVisibleRect: NSUInteger = 0x200;
 #[allow(non_upper_case_globals)]
 const NSWindowAnimationBehaviorUtilityWindow: NSInteger = 4;
+#[cfg(not(feature = "wgpu-renderer"))]
 #[allow(non_upper_case_globals)]
 const NSViewLayerContentsRedrawDuringViewResize: NSInteger = 2;
 // https://developer.apple.com/documentation/appkit/nsdragoperation
@@ -218,6 +225,7 @@ unsafe fn build_classes() {
                 handle_view_event as extern "C" fn(&Object, Sel, id),
             );
 
+            #[cfg(not(feature = "wgpu-renderer"))]
             decl.add_method(
                 sel!(makeBackingLayer),
                 make_backing_layer as extern "C" fn(&Object, Sel) -> id,
@@ -232,6 +240,7 @@ unsafe fn build_classes() {
                 sel!(setFrameSize:),
                 set_frame_size as extern "C" fn(&Object, Sel, NSSize),
             );
+            #[cfg(not(feature = "wgpu-renderer"))]
             decl.add_method(
                 sel!(displayLayer:),
                 display_layer as extern "C" fn(&Object, Sel, id),
@@ -1012,6 +1021,25 @@ impl MacWindow {
             let native_view: id = msg_send![VIEW_CLASS, alloc];
             let native_view = NSView::initWithFrame_(native_view, NSView::bounds(content_view));
             assert!(!native_view.is_null());
+            #[cfg(feature = "wgpu-renderer")]
+            let raw_window = RawWindow {
+                handle: native_view,
+            };
+
+            #[cfg(feature = "wgpu-renderer")]
+            let wgpu_config = {
+                let backing_rect: NSRect =
+                    msg_send![native_view, convertRectToBacking: bounds];
+                let physical_size = size(
+                    DevicePixels(backing_rect.size.width as i32),
+                    DevicePixels(backing_rect.size.height as i32),
+                );
+                WgpuSurfaceConfig {
+                    size: physical_size,
+                    transparent: false,
+                    preferred_present_mode: None,
+                }
+            };
 
             let state = Arc::new(Mutex::new(MacWindowState {
                 handle,
@@ -1024,6 +1052,7 @@ impl MacWindow {
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
                 frame_source: None,
+                #[cfg(not(feature = "wgpu-renderer"))]
                 renderer: renderer::new_renderer(
                     renderer_context,
                     native_window as *mut _,
@@ -1031,6 +1060,14 @@ impl MacWindow {
                     bounds.size.map(|pixels| pixels.as_f32()),
                     false,
                 ),
+                #[cfg(feature = "wgpu-renderer")]
+                renderer: renderer::Renderer::new(
+                    renderer_context,
+                    &raw_window,
+                    wgpu_config,
+                    None,
+                )
+                .unwrap(),
                 request_frame_callback: None,
                 event_callback: None,
                 activate_callback: None,
@@ -1104,16 +1141,19 @@ impl MacWindow {
             native_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable);
             native_view.setWantsBestResolutionOpenGLSurface_(YES);
 
-            // From winit crate: On Mojave, views automatically become layer-backed shortly after
-            // being added to a native_window. Changing the layer-backedness of a view breaks the
-            // association between the view and its associated OpenGL context. To work around this,
-            // on we explicitly make the view layer-backed up front so that AppKit doesn't do it
-            // itself and break the association with its context.
-            native_view.setWantsLayer(YES);
-            let _: () = msg_send![
-            native_view,
-            setLayerContentsRedrawPolicy: NSViewLayerContentsRedrawDuringViewResize
-            ];
+            #[cfg(not(feature = "wgpu-renderer"))]
+            {
+                // From winit crate: On Mojave, views automatically become layer-backed shortly after
+                // being added to a native_window. Changing the layer-backedness of a view breaks the
+                // association between the view and its associated OpenGL context. To work around this,
+                // on we explicitly make the view layer-backed up front so that AppKit doesn't do it
+                // itself and break the association with its context.
+                native_view.setWantsLayer(YES);
+                let _: () = msg_send![
+                    native_view,
+                    setLayerContentsRedrawPolicy: NSViewLayerContentsRedrawDuringViewResize
+                ];
+            }
 
             content_view.addSubview_(native_view.autorelease());
             native_window.makeFirstResponder_(native_view);
@@ -2142,7 +2182,7 @@ impl PlatformWindow for MacWindow {
         NSBeep()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(all(any(test, feature = "test-support"), not(feature = "wgpu-renderer")))]
     fn render_to_image(&self, scene: &gpui::Scene) -> Result<RgbaImage> {
         let mut this = self.0.lock();
         this.renderer.render_to_image(scene)
@@ -2783,6 +2823,7 @@ fn update_window_scale_factor(window_state: &Arc<Mutex<MacWindowState>>) {
     let scale_factor = lock.scale_factor();
     let size = lock.content_size();
     let drawable_size = size.to_device_pixels(scale_factor);
+    #[cfg(not(feature = "wgpu-renderer"))]
     if let Some(layer) = lock.renderer.layer() {
         unsafe {
             let _: () = msg_send![
@@ -2862,6 +2903,7 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
 
         if lock.activated_least_once {
             if let Some(mut callback) = lock.request_frame_callback.take() {
+                #[cfg(not(feature = "wgpu-renderer"))]
                 lock.renderer.set_presents_with_transaction(true);
                 lock.stop_display_link();
                 drop(lock);
@@ -2869,6 +2911,7 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
 
                 let mut lock = window_state.lock();
                 lock.request_frame_callback = Some(callback);
+                #[cfg(not(feature = "wgpu-renderer"))]
                 lock.renderer.set_presents_with_transaction(false);
                 lock.start_display_link();
             }
@@ -2930,6 +2973,7 @@ extern "C" fn close_window(this: &Object, _: Sel) {
     }
 }
 
+#[cfg(not(feature = "wgpu-renderer"))]
 extern "C" fn make_backing_layer(this: &Object, _: Sel) -> id {
     let window_state = unsafe { get_window_state(this) };
     let window_state = window_state.as_ref().lock();
@@ -2979,6 +3023,7 @@ extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
     };
 }
 
+#[cfg(not(feature = "wgpu-renderer"))]
 extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();

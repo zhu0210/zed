@@ -11,10 +11,15 @@ mod events;
 mod keyboard;
 mod pasteboard;
 mod system_notifications;
+#[cfg(feature = "wgpu-renderer")]
+mod wgpu_backend;
 
+#[cfg(not(feature = "wgpu-renderer"))]
+pub mod metal_renderer;
 #[cfg(feature = "screen-capture")]
 mod screen_capture;
 
+#[cfg(not(feature = "wgpu-renderer"))]
 use gpui_apple::metal_renderer as renderer;
 
 pub mod metal_renderer {
@@ -23,6 +28,8 @@ pub mod metal_renderer {
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
     pub use gpui_apple::metal_renderer::MetalHeadlessRenderer;
 }
+#[cfg(feature = "wgpu-renderer")]
+use wgpu_backend::renderer;
 
 #[cfg(feature = "font-kit")]
 mod open_type;
@@ -31,8 +38,8 @@ mod open_type;
 mod text_system;
 
 mod platform;
-mod window;
 mod window_appearance;
+mod window;
 
 use cocoa::{
     base::{id, nil},
