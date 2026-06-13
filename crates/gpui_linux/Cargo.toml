@@ -58,7 +58,7 @@ bytemuck = "1"
 collections.workspace = true
 image.workspace = true
 futures.workspace = true
-gpui.workspace = true
+gpui = { workspace = true, features = ["wgpu"] }
 gpui_wgpu = { workspace = true, optional = true, features = ["font-kit"] }
 http_client.workspace = true
 itertools.workspace = true

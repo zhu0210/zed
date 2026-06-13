@@ -1,11 +1,11 @@
 #![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
 
 fn main() {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(feature = "wgpu-renderer")))]
     macos_build::run();
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "wgpu-renderer")))]
 mod macos_build {
     use std::{
         env,

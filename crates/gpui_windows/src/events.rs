@@ -209,6 +209,7 @@ impl WindowsWindowInner {
         let new_logical_size = device_size.to_pixels(scale_factor);
 
         self.state.logical_size.set(new_logical_size);
+        #[cfg(not(feature = "wgpu-renderer"))]
         if should_resize_renderer
             && let Err(e) = self.state.renderer.borrow_mut().resize(device_size)
         {
@@ -217,6 +218,11 @@ impl WindowsWindowInner {
                 .invalidate_devices
                 .store(true, std::sync::atomic::Ordering::Release);
         }
+        #[cfg(feature = "wgpu-renderer")]
+        self.state
+            .renderer
+            .borrow_mut()
+            .update_drawable_size(device_size);
         if let Some(mut callback) = self.state.callbacks.resize.take() {
             callback(new_logical_size, scale_factor);
             self.state.callbacks.resize.set(Some(callback));
@@ -631,6 +637,7 @@ impl WindowsWindowInner {
         let ime_enabled = self
             .with_input_handler(|input_handler| input_handler.query_accepts_text_input())
             .unwrap_or(false);
+
         if ime_enabled == self.state.ime_enabled.get() {
             return;
         }
@@ -1193,21 +1200,24 @@ impl WindowsWindowInner {
     }
 
     fn handle_device_lost(&self, lparam: LPARAM) -> Option<isize> {
-        let devices = lparam.0 as *const DirectXDevices;
-        let devices = unsafe { &*devices };
-        if let Err(err) = self
-            .state
-            .renderer
-            .borrow_mut()
-            .handle_device_lost(&devices)
+        #[cfg(not(feature = "wgpu-renderer"))]
         {
-            panic!("Device lost: {err}");
+            let devices = lparam.0 as *const DirectXDevices;
+            let devices = unsafe { &*devices };
+            if let Err(err) = self
+                .state
+                .renderer
+                .borrow_mut()
+                .handle_device_lost(&devices)
+            {
+                panic!("Device lost: {err}");
+            }
+            // Make sure the first `draw_window` after recovery (whether it comes
+            // from the forced WM_GPUI_FORCE_UPDATE_WINDOW or a stray WM_PAINT in
+            // between) is treated as a forced render so it both clears
+            // `skip_draws` and bypasses the view cache.
+            self.state.force_render_after_recovery.set(true);
         }
-        // Make sure the first `draw_window` after recovery (whether it comes
-        // from the forced WM_GPUI_FORCE_UPDATE_WINDOW or a stray WM_PAINT in
-        // between) is treated as a forced render so it both clears
-        // `skip_draws` and bypasses the view cache.
-        self.state.force_render_after_recovery.set(true);
         Some(0)
     }
 
@@ -1232,7 +1242,11 @@ impl WindowsWindowInner {
             }
         }
 
+        #[cfg(not(feature = "wgpu-renderer"))]
         let force_render = force_render || self.state.force_render_after_recovery.take();
+        #[cfg(feature = "wgpu-renderer")]
+        let force_render = force_render;
+        #[cfg(not(feature = "wgpu-renderer"))]
         if force_render {
             // Re-enable drawing after a device loss recovery. The forced render
             // will rebuild the scene with fresh atlas textures.

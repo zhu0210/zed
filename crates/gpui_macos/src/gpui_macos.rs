@@ -10,14 +10,20 @@ mod display_link;
 mod events;
 mod keyboard;
 mod pasteboard;
+#[cfg(feature = "wgpu-renderer")]
+mod wgpu_backend;
 
+#[cfg(not(feature = "wgpu-renderer"))]
+mod metal_atlas;
+#[cfg(not(feature = "wgpu-renderer"))]
+pub mod metal_renderer;
 #[cfg(feature = "screen-capture")]
 mod screen_capture;
 
-mod metal_atlas;
-pub mod metal_renderer;
-
+#[cfg(not(feature = "wgpu-renderer"))]
 use metal_renderer as renderer;
+#[cfg(feature = "wgpu-renderer")]
+use wgpu_backend::renderer;
 
 #[cfg(feature = "font-kit")]
 mod open_type;
@@ -26,8 +32,8 @@ mod open_type;
 mod text_system;
 
 mod platform;
-mod window;
 mod window_appearance;
+mod window;
 
 use cocoa::{
     base::{id, nil},

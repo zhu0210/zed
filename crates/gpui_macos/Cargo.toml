@@ -12,7 +12,8 @@ workspace = true
 path = "src/gpui_macos.rs"
 
 [features]
-default = ["gpui/default"]
+default = ["gpui/default", "wgpu-renderer" ]
+wgpu-renderer = ["gpui/wgpu", "dep:gpui_wgpu"]
 test-support = ["gpui/test-support"]
 runtime_shaders = []
 font-kit = ["dep:font-kit"]
@@ -61,6 +62,7 @@ smallvec.workspace = true
 strum.workspace = true
 util.workspace = true
 uuid.workspace = true
+gpui_wgpu = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.build-dependencies]
 cbindgen = { version = "0.28.0", default-features = false }

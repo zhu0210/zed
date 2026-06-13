@@ -346,12 +346,12 @@ grammars = { path = "crates/grammars" }
 gpui = { path = "crates/gpui", default-features = false }
 gpui_shared_string = { path = "crates/gpui_shared_string" }
 gpui_linux = { path = "crates/gpui_linux", default-features = false }
-gpui_macos = { path = "crates/gpui_macos", default-features = false }
+gpui_macos = { path = "crates/gpui_macos", default-features = false, features = ["wgpu-renderer"]}
 gpui_macros = { path = "crates/gpui_macros" }
-gpui_platform = { path = "crates/gpui_platform", default-features = false }
+gpui_platform = { path = "crates/gpui_platform", default-features = false, features=["wgpu"] }
 gpui_web = { path = "crates/gpui_web" }
 gpui_wgpu = { path = "crates/gpui_wgpu" }
-gpui_windows = { path = "crates/gpui_windows", default-features = false }
+gpui_windows = { path = "crates/gpui_windows", default-features = false, features=["wgpu-renderer"] }
 gpui_tokio = { path = "crates/gpui_tokio" }
 gpui_util = { path = "crates/gpui_util" }
 html_to_markdown = { path = "crates/html_to_markdown" }
