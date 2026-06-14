@@ -110,7 +110,10 @@ impl WindowsWindowInner {
             WM_SHOWWINDOW => self.handle_window_visibility_changed(handle, wparam),
             WM_GPUI_CURSOR_STYLE_CHANGED => self.handle_cursor_changed(lparam),
             WM_GPUI_FORCE_UPDATE_WINDOW => self.draw_window(handle, true),
-            WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
+            WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(
+                #[cfg(not(feature = "wgpu-renderer"))]
+                lparam,
+            ),
             DM_POINTERHITTEST => self.handle_dm_pointer_hit_test(wparam),
             WM_GETOBJECT => self.handle_wm_getobject(wparam, lparam),
             _ => None,
@@ -186,6 +189,8 @@ impl WindowsWindowInner {
         let new_size = size(DevicePixels(width), DevicePixels(height));
 
         let scale_factor = self.state.scale_factor.get();
+
+        #[cfg(not(feature = "wgpu-renderer"))]
         let mut should_resize_renderer = false;
         if let Some(restore_from_minimized) = self.state.restore_from_minimized.take() {
             self.state
@@ -193,10 +198,18 @@ impl WindowsWindowInner {
                 .request_frame
                 .set(Some(restore_from_minimized));
         } else {
-            should_resize_renderer = true;
+            #[cfg(not(feature = "wgpu-renderer"))]
+            {
+                should_resize_renderer = true;
+            }
         }
 
-        self.handle_size_change(new_size, scale_factor, should_resize_renderer);
+        self.handle_size_change(
+            new_size,
+            scale_factor,
+            #[cfg(not(feature = "wgpu-renderer"))]
+            should_resize_renderer,
+        );
         Some(0)
     }
 
@@ -204,7 +217,7 @@ impl WindowsWindowInner {
         &self,
         device_size: Size<DevicePixels>,
         scale_factor: f32,
-        should_resize_renderer: bool,
+        #[cfg(not(feature = "wgpu-renderer"))] should_resize_renderer: bool,
     ) {
         let new_logical_size = device_size.to_pixels(scale_factor);
 
@@ -855,7 +868,12 @@ impl WindowsWindowInner {
                 // SetWindowPos may not send WM_SIZE for maximized windows in some cases,
                 // so we manually update the size to ensure proper rendering
                 let device_size = size(DevicePixels(width), DevicePixels(height));
-                self.handle_size_change(device_size, new_scale_factor, true);
+                self.handle_size_change(
+                    device_size,
+                    new_scale_factor,
+                    #[cfg(not(feature = "wgpu-renderer"))]
+                    true,
+                );
             }
         } else {
             // For non-maximized windows, use the suggested RECT from the system
@@ -1199,7 +1217,10 @@ impl WindowsWindowInner {
         None
     }
 
-    fn handle_device_lost(&self, lparam: LPARAM) -> Option<isize> {
+    fn handle_device_lost(
+        &self,
+        #[cfg(not(feature = "wgpu-renderer"))] lparam: LPARAM,
+    ) -> Option<isize> {
         #[cfg(not(feature = "wgpu-renderer"))]
         {
             let devices = lparam.0 as *const DirectXDevices;
