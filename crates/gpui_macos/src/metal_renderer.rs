@@ -125,6 +125,7 @@ pub(crate) struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    surface_rgba_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -322,6 +323,14 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let surface_rgba_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "surface_rgba",
+            "surface_vertex",
+            "surface_rgba_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
@@ -344,6 +353,7 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            surface_rgba_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -1475,7 +1485,6 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
-        command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
         command_encoder.set_vertex_buffer(
             SurfaceInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1491,7 +1500,11 @@ impl MetalRenderer {
             let (image_buffer, format) = match &surface.content {
                 gpui::SurfaceContent::CvPixelBuffer(pixel_buffer) => {
                     let format = match pixel_buffer.get_pixel_format() {
-                        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange => GpuTextureFormat::Nv12,
+                        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+                        | kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange => {
+                            GpuTextureFormat::Nv12
+                        }
+                        kCVPixelFormatType_32BGRA => GpuTextureFormat::Bgra8Unorm,
                         pf => panic!(
                             "Unsupported CVPixelBuffer pixel format in Metal renderer: {pf:#x}"
                         ),
@@ -1508,6 +1521,8 @@ impl MetalRenderer {
 
             match format {
                 GpuTextureFormat::Nv12 => {
+                    command_encoder
+                        .set_render_pipeline_state(&self.surfaces_pipeline_state);
                     let y_texture = self
                         .core_video_texture_cache
                         .create_texture_from_image(
@@ -1545,6 +1560,29 @@ impl MetalRenderer {
                             let texture =
                                 CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
                             Some(metal::TextureRef::from_ptr(texture as *mut _))
+                        },
+                    );
+                }
+                GpuTextureFormat::Bgra8Unorm => {
+                    command_encoder
+                        .set_render_pipeline_state(&self.surface_rgba_pipeline_state);
+                    let texture = self
+                        .core_video_texture_cache
+                        .create_texture_from_image(
+                            image_buffer.as_concrete_TypeRef(),
+                            None,
+                            MTLPixelFormat::BGRA8Unorm,
+                            image_buffer.get_width(),
+                            image_buffer.get_height(),
+                            0,
+                        )
+                        .unwrap();
+                    command_encoder.set_fragment_texture(
+                        SurfaceInputIndex::RgbaTexture as u64,
+                        unsafe {
+                            let raw =
+                                CVMetalTextureGetTexture(texture.as_concrete_TypeRef());
+                            Some(metal::TextureRef::from_ptr(raw as *mut _))
                         },
                     );
                 }
@@ -1765,6 +1803,7 @@ enum SurfaceInputIndex {
     TextureSize = 3,
     YTexture = 4,
     CbCrTexture = 5,
+    RgbaTexture = 6,
 }
 
 #[repr(C)]

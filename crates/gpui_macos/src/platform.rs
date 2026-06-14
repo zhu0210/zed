@@ -1183,6 +1183,120 @@ impl Platform for MacPlatform {
     }
 }
 
+#[cfg(feature = "wgpu-renderer")]
+/// Import a [`core_video::pixel_buffer::CVPixelBuffer`] into a wgpu texture
+/// for compositing via [`gpui::surface`].
+///
+/// Locks the pixel buffer's base address and copies the pixel data into a
+/// newly-created wgpu texture. Returns `None` if the pixel buffer cannot be
+/// locked (e.g., GPU-only IOSurface without CPU access), if the wgpu context
+/// is not available, or if the pixel format is unsupported.
+///
+/// Currently supports BGRA8 (the standard macOS video format). NV12 support
+/// (two-plane YUV) will be added when cross-platform NV12 rendering is
+/// implemented.
+///
+/// # Example
+///
+/// ```ignore
+/// let gpu = window.gpu_context().unwrap();
+/// let texture = import_cv_pixel_buffer_to_wgpu(&pixel_buffer, &gpu)?;
+/// let descriptor = cv_pixel_buffer_descriptor(&pixel_buffer);
+/// surface((texture, descriptor)).object_fit(ObjectFit::Contain)
+/// ```
+///
+/// TODO: Implement zero-copy path via CVMetalTextureCache → Metal texture →
+/// wgpu texture import (`create_texture_from_hal`) for better performance.
+#[cfg(feature = "wgpu-renderer")]
+pub fn import_cv_pixel_buffer_to_wgpu(
+    pixel_buffer: &core_video::pixel_buffer::CVPixelBuffer,
+    gpu_context: &gpui_wgpu::GpuContext,
+) -> Option<std::sync::Arc<gpui_wgpu::wgpu::Texture>> {
+    use core_video::pixel_buffer::{
+        kCVPixelBufferLock_ReadOnly, kCVPixelFormatType_32BGRA,
+    };
+    use gpui_wgpu::wgpu;
+
+    let ctx = gpu_context.borrow();
+    let wgpu_ctx = ctx.as_ref()?;
+
+    let (wgpu_format, bytes_per_pixel) = match pixel_buffer.get_pixel_format() {
+        kCVPixelFormatType_32BGRA => (wgpu::TextureFormat::BGRA8Unorm, 4u32),
+        _ => {
+            log::warn!(
+                "unsupported CVPixelBuffer pixel format: {:#x}",
+                pixel_buffer.get_pixel_format()
+            );
+            return None;
+        }
+    };
+
+    let width = pixel_buffer.get_width() as u32;
+    let height = pixel_buffer.get_height() as u32;
+    let bytes_per_row = pixel_buffer.get_bytes_per_row() as u32;
+    let expected_bytes_per_row = width * bytes_per_pixel;
+
+    let texture = wgpu_ctx.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("cv_pixel_buffer_import"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu_format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    let copy_result = pixel_buffer.lock_base_address(kCVPixelBufferLock_ReadOnly);
+    if copy_result != 0 {
+        log::warn!(
+            "failed to lock CVPixelBuffer base address: error {}",
+            copy_result
+        );
+        return Some(std::sync::Arc::new(texture));
+    }
+
+    let base_ptr = unsafe { pixel_buffer.get_base_address() };
+    if base_ptr.is_null() {
+        pixel_buffer.unlock_base_address(kCVPixelBufferLock_ReadOnly);
+        log::debug!("CVPixelBuffer has no CPU-accessible base address; returning empty texture");
+        return Some(std::sync::Arc::new(texture));
+    }
+
+    let data = unsafe {
+        std::slice::from_raw_parts(base_ptr as *const u8, (bytes_per_row * height) as usize)
+    };
+
+    wgpu_ctx.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
+            aspect: wgpu::TextureAspect::All,
+        },
+        data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(bytes_per_row),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    pixel_buffer.unlock_base_address(kCVPixelBufferLock_ReadOnly);
+    drop(data);
+
+    Some(std::sync::Arc::new(texture))
+}
+
 unsafe fn path_from_objc(path: id) -> PathBuf {
     let len = msg_send![path, lengthOfBytesUsingEncoding: NSUTF8StringEncoding];
     let bytes = unsafe { path.UTF8String() as *const u8 };

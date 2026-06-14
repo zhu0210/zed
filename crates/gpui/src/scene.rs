@@ -5,8 +5,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, DevicePixels, Edges,
+    Hsla, Pixels, Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
     fmt::Debug,
@@ -727,6 +727,15 @@ pub enum SurfaceContent {
     /// no separate unregistration step is needed.
     #[cfg(feature = "wgpu")]
     WgpuTexture(Arc<wgpu::Texture>),
+    /// Cross-platform NV12 wgpu texture (two-plane YUV 4:2:0). The Y plane
+    /// is R8Unorm, the CbCr plane is Rg8Unorm. The [`Arc`]s own the GPU
+    /// resources — no separate unregistration step is needed.
+    #[cfg(feature = "wgpu")]
+    WgpuTextureNv12 {
+        y_texture: Arc<wgpu::Texture>,
+        cb_cr_texture: Arc<wgpu::Texture>,
+        native_size: Size<DevicePixels>,
+    },
 }
 
 /// A GPU texture composited into the scene.

@@ -4140,6 +4140,37 @@ impl Window {
             content: SurfaceContent::WgpuTexture(texture),
         });
     }
+
+    /// Paint an NV12 (YUV 4:2:0) wgpu texture into the scene (cross-platform).
+    ///
+    /// Takes two textures — the Y plane (R8Unorm) and the CbCr plane (Rg8Unorm).
+    /// The renderer applies YCbCr→RGB conversion in the fragment shader.
+    ///
+    /// This is a low-level API. Most callers should use the [`surface()`] element.
+    #[cfg(feature = "wgpu")]
+    pub fn paint_surface_with_nv12_texture(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        y_texture: Arc<wgpu::Texture>,
+        cb_cr_texture: Arc<wgpu::Texture>,
+        native_size: Size<DevicePixels>,
+    ) {
+        use crate::{PaintSurface, SurfaceContent};
+
+        self.invalidator.debug_assert_paint();
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            content: SurfaceContent::WgpuTextureNv12 {
+                y_texture,
+                cb_cr_texture,
+                native_size,
+            },
+        });
+    }
 }
 
 /// Convert a CVPixelBuffer pixel format code to a GPUI [`GpuTextureFormat`].

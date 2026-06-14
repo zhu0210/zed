@@ -58,6 +58,9 @@ pub(crate) use text_system::*;
 
 pub use platform::MacPlatform;
 
+#[cfg(feature = "wgpu-renderer")]
+pub use platform::import_cv_pixel_buffer_to_wgpu;
+
 trait BoolExt {
     fn to_objc(self) -> BOOL;
 }

@@ -1493,22 +1493,23 @@ impl WgpuRenderer {
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
-        // Collect bind groups and views before issuing draws so that the
-        // texture views outlive the draw commands that reference them.
-        struct SurfaceDraw {
+        struct RgbaDraw {
             bind_group: wgpu::BindGroup,
             scissor_rect: (u32, u32, u32, u32),
             _view: wgpu::TextureView,
         }
-        let mut draws: Vec<SurfaceDraw> = Vec::new();
+        struct Nv12Draw {
+            bind_group: wgpu::BindGroup,
+            _uniform_buffer: wgpu::Buffer,
+            scissor_rect: (u32, u32, u32, u32),
+            _y_view: wgpu::TextureView,
+            _cb_cr_view: wgpu::TextureView,
+        }
+
+        let mut rgba_draws: Vec<RgbaDraw> = Vec::new();
+        let mut nv12_draws: Vec<Nv12Draw> = Vec::new();
 
         for surface in surfaces {
-            let texture = match &surface.content {
-                gpui::SurfaceContent::WgpuTexture(texture) => texture,
-                #[allow(unreachable_patterns)]
-                _ => continue,
-            };
-
             // Skip zero-sized surfaces (collapsed panels, hidden elements).
             if surface.bounds.size.width.0 <= 0.0
                 || surface.bounds.size.height.0 <= 0.0
@@ -1516,64 +1517,170 @@ impl WgpuRenderer {
                 continue;
             }
 
-            let instance = SurfaceInstance {
-                bounds: surface.bounds.into(),
-                content_mask: surface.content_mask.bounds.into(),
-            };
-            let data = unsafe {
-                std::slice::from_raw_parts(
-                    &instance as *const SurfaceInstance as *const u8,
-                    std::mem::size_of::<SurfaceInstance>(),
-                )
-            };
-            let Some((offset, size)) = self.write_to_instance_buffer(instance_offset, data) else {
-                return false;
-            };
-
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             let resources = self.resources();
-            let bind_group =
-                resources
-                    .device
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("surface_rgba_bind_group"),
-                        layout: &resources.bind_group_layouts.instances_with_texture,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: self.instance_binding(offset, size),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::TextureView(&view),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: wgpu::BindingResource::Sampler(
-                                    &resources.atlas_sampler,
-                                ),
-                            },
-                        ],
+
+            match &surface.content {
+                gpui::SurfaceContent::WgpuTexture(texture) => {
+                    let instance = SurfaceInstance {
+                        bounds: surface.bounds.into(),
+                        content_mask: surface.content_mask.bounds.into(),
+                    };
+                    let data = unsafe {
+                        std::slice::from_raw_parts(
+                            &instance as *const SurfaceInstance as *const u8,
+                            std::mem::size_of::<SurfaceInstance>(),
+                        )
+                    };
+                    let Some((offset, size)) =
+                        self.write_to_instance_buffer(instance_offset, data)
+                    else {
+                        return false;
+                    };
+
+                    let view =
+                        texture.create_view(&wgpu::TextureViewDescriptor::default());
+                    let bind_group = resources.device.create_bind_group(
+                        &wgpu::BindGroupDescriptor {
+                            label: Some("surface_rgba_bind_group"),
+                            layout: &resources.bind_group_layouts.instances_with_texture,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: self.instance_binding(offset, size),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::TextureView(&view),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: wgpu::BindingResource::Sampler(
+                                        &resources.atlas_sampler,
+                                    ),
+                                },
+                            ],
+                        },
+                    );
+
+                    let scissor_rect = (
+                        surface.content_mask.bounds.origin.x.0.max(0.0) as u32,
+                        surface.content_mask.bounds.origin.y.0.max(0.0) as u32,
+                        surface.content_mask.bounds.size.width.0.max(0.0) as u32,
+                        surface.content_mask.bounds.size.height.0.max(0.0) as u32,
+                    );
+
+                    rgba_draws.push(RgbaDraw {
+                        bind_group,
+                        scissor_rect,
+                        _view: view,
                     });
+                    *instance_offset += 1;
+                }
+                gpui::SurfaceContent::WgpuTextureNv12 {
+                    y_texture,
+                    cb_cr_texture,
+                    ..
+                } => {
+                    let params = SurfaceParams {
+                        bounds: surface.bounds.into(),
+                        content_mask: surface.content_mask.bounds.into(),
+                    };
+                    let params_data = unsafe {
+                        std::slice::from_raw_parts(
+                            &params as *const SurfaceParams as *const u8,
+                            std::mem::size_of::<SurfaceParams>(),
+                        )
+                    };
 
-            let scissor_rect = (
-                surface.content_mask.bounds.origin.x.0.max(0.0) as u32,
-                surface.content_mask.bounds.origin.y.0.max(0.0) as u32,
-                surface.content_mask.bounds.size.width.0.max(0.0) as u32,
-                surface.content_mask.bounds.size.height.0.max(0.0) as u32,
-            );
+                    let uniform_buffer =
+                        resources.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("surface_nv12_uniform"),
+                            size: std::mem::size_of::<SurfaceParams>() as u64,
+                            usage: wgpu::BufferUsages::UNIFORM
+                                | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        });
+                    resources.queue.write_buffer(
+                        &uniform_buffer,
+                        0,
+                        params_data,
+                    );
 
-            draws.push(SurfaceDraw {
-                bind_group,
-                scissor_rect,
-                _view: view,
-            });
-            *instance_offset += 1;
+                    let y_view =
+                        y_texture.create_view(&wgpu::TextureViewDescriptor::default());
+                    let cb_cr_view = cb_cr_texture
+                        .create_view(&wgpu::TextureViewDescriptor::default());
+
+                    let bind_group = resources.device.create_bind_group(
+                        &wgpu::BindGroupDescriptor {
+                            label: Some("surface_nv12_bind_group"),
+                            layout: &resources.bind_group_layouts.surfaces,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: uniform_buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::TextureView(
+                                        &y_view,
+                                    ),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: wgpu::BindingResource::TextureView(
+                                        &cb_cr_view,
+                                    ),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 3,
+                                    resource: wgpu::BindingResource::Sampler(
+                                        &resources.atlas_sampler,
+                                    ),
+                                },
+                            ],
+                        },
+                    );
+
+                    let scissor_rect = (
+                        surface.content_mask.bounds.origin.x.0.max(0.0) as u32,
+                        surface.content_mask.bounds.origin.y.0.max(0.0) as u32,
+                        surface.content_mask.bounds.size.width.0.max(0.0) as u32,
+                        surface.content_mask.bounds.size.height.0.max(0.0) as u32,
+                    );
+
+                    nv12_draws.push(Nv12Draw {
+                        bind_group,
+                        _uniform_buffer: uniform_buffer,
+                        scissor_rect,
+                        _y_view: y_view,
+                        _cb_cr_view: cb_cr_view,
+                    });
+                }
+                #[allow(unreachable_patterns)]
+                _ => continue,
+            }
         }
 
         let resources = self.resources();
-        for draw in &draws {
+
+        // Draw RGBA surfaces with the passthrough pipeline.
+        for draw in &rgba_draws {
             pass.set_pipeline(&resources.pipelines.surface_rgba);
+            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+            pass.set_bind_group(1, &draw.bind_group, &[]);
+            pass.set_scissor_rect(
+                draw.scissor_rect.0,
+                draw.scissor_rect.1,
+                draw.scissor_rect.2,
+                draw.scissor_rect.3,
+            );
+            pass.draw(0..4, 0..1);
+        }
+
+        // Draw NV12 surfaces with the YUV→RGB conversion pipeline.
+        for draw in &nv12_draws {
+            pass.set_pipeline(&resources.pipelines.surfaces);
             pass.set_bind_group(0, &resources.globals_bind_group, &[]);
             pass.set_bind_group(1, &draw.bind_group, &[]);
             pass.set_scissor_rect(
