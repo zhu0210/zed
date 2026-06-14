@@ -46,6 +46,13 @@ struct SurfaceParams {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+struct SurfaceInstance {
+    bounds: PodBounds,
+    content_mask: PodBounds,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct GammaParams {
     gamma_ratios: [f32; 4],
     grayscale_enhanced_contrast: f32,
@@ -92,6 +99,7 @@ struct WgpuPipelines {
     poly_sprites: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
+    surface_rgba: wgpu::RenderPipeline,
 }
 
 struct WgpuBindGroupLayouts {
@@ -872,6 +880,18 @@ impl WgpuRenderer {
             &layouts.globals,
             &layouts.surfaces,
             wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &shader_module,
+        );
+
+        let surface_rgba = create_pipeline(
+            "surface_rgba",
+            "vs_surface_rgba",
+            "fs_surface_rgba",
+            &layouts.globals,
+            &layouts.instances_with_texture,
+            wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target)],
             1,
             &shader_module,
@@ -887,6 +907,7 @@ impl WgpuRenderer {
             subpixel_sprites,
             poly_sprites,
             surfaces,
+            surface_rgba,
         }
     }
 
@@ -1300,10 +1321,12 @@ impl WgpuRenderer {
                                 &mut instance_offset,
                                 &mut pass,
                             ),
-                        PrimitiveBatch::Surfaces(_surfaces) => {
-                            // Surfaces are macOS-only for video playback
-                            // Not implemented for Linux/wgpu
-                            true
+                        PrimitiveBatch::Surfaces(range) => {
+                            self.draw_surfaces(
+                                &scene.surfaces[range],
+                                &mut instance_offset,
+                                &mut pass,
+                            )
                         }
                     };
                     if !ok {
@@ -1444,6 +1467,107 @@ impl WgpuRenderer {
             instance_offset,
             pass,
         )
+    }
+
+    fn draw_surfaces(
+        &self,
+        surfaces: &[gpui::PaintSurface],
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
+        // Collect bind groups and views before issuing draws so that the
+        // texture views outlive the draw commands that reference them.
+        struct SurfaceDraw {
+            bind_group: wgpu::BindGroup,
+            scissor_rect: (u32, u32, u32, u32),
+            _view: wgpu::TextureView,
+        }
+        let mut draws: Vec<SurfaceDraw> = Vec::new();
+
+        for surface in surfaces {
+            let texture = match &surface.content {
+                gpui::SurfaceContent::WgpuTexture(texture) => texture,
+                #[allow(unreachable_patterns)]
+                _ => continue,
+            };
+
+            // Skip zero-sized surfaces (collapsed panels, hidden elements).
+            if surface.bounds.size.width.0 <= 0.0
+                || surface.bounds.size.height.0 <= 0.0
+            {
+                continue;
+            }
+
+            let instance = SurfaceInstance {
+                bounds: surface.bounds.into(),
+                content_mask: surface.content_mask.bounds.into(),
+            };
+            let data = unsafe {
+                std::slice::from_raw_parts(
+                    &instance as *const SurfaceInstance as *const u8,
+                    std::mem::size_of::<SurfaceInstance>(),
+                )
+            };
+            let Some((offset, size)) = self.write_to_instance_buffer(instance_offset, data) else {
+                return false;
+            };
+
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let resources = self.resources();
+            let bind_group =
+                resources
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("surface_rgba_bind_group"),
+                        layout: &resources.bind_group_layouts.instances_with_texture,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.instance_binding(offset, size),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(&view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::Sampler(
+                                    &resources.atlas_sampler,
+                                ),
+                            },
+                        ],
+                    });
+
+            let scissor_rect = (
+                surface.content_mask.bounds.origin.x.0.max(0.0) as u32,
+                surface.content_mask.bounds.origin.y.0.max(0.0) as u32,
+                surface.content_mask.bounds.size.width.0.max(0.0) as u32,
+                surface.content_mask.bounds.size.height.0.max(0.0) as u32,
+            );
+
+            draws.push(SurfaceDraw {
+                bind_group,
+                scissor_rect,
+                _view: view,
+            });
+            *instance_offset += 1;
+        }
+
+        let resources = self.resources();
+        for draw in &draws {
+            pass.set_pipeline(&resources.pipelines.surface_rgba);
+            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+            pass.set_bind_group(1, &draw.bind_group, &[]);
+            pass.set_scissor_rect(
+                draw.scissor_rect.0,
+                draw.scissor_rect.1,
+                draw.scissor_rect.2,
+                draw.scissor_rect.3,
+            );
+            pass.draw(0..4, 0..1);
+        }
+
+        true
     }
 
     fn draw_instances(

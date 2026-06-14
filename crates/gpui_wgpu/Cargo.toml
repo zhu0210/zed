@@ -16,7 +16,7 @@ default = []
 font-kit = ["dep:font-kit"]
 
 [dependencies]
-gpui.workspace = true
+gpui = { workspace = true, features = ["wgpu"] }
 anyhow.workspace = true
 bytemuck = "1"
 collections.workspace = true

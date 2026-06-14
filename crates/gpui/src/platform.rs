@@ -1164,6 +1164,41 @@ impl From<TileId> for etagere::AllocId {
     }
 }
 
+// ============================================================================
+// External GPU Texture Types
+// ============================================================================
+
+/// Describes a GPU texture at registration time.
+///
+/// Used by the [`surface()`] element to compute correct [`ObjectFit`] bounds.
+#[derive(Copy, Clone, Debug)]
+pub struct GpuTextureDescriptor {
+    /// Size in device pixels.
+    pub size: Size<DevicePixels>,
+    /// Pixel format.
+    pub format: GpuTextureFormat,
+    /// Color space. Defaults to sRGB.
+    pub color_space: GpuTextureColorSpace,
+}
+
+/// Pixel format of a GPU texture.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum GpuTextureFormat {
+    /// RGBA 8-bit per channel, unorm.
+    Rgba8Unorm,
+    /// BGRA 8-bit per channel, unorm.
+    Bgra8Unorm,
+    /// Two-plane YUV 4:2:0 (biplanar). macOS VideoToolbox native format.
+    Nv12,
+}
+
+/// Color space of a GPU texture.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum GpuTextureColorSpace {
+    #[default]
+    Srgb,
+}
+
 #[expect(missing_docs)]
 pub struct PlatformInputHandler {
     cx: AsyncWindowContext,

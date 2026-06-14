@@ -1362,3 +1362,37 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
 
     return ycbcr_to_RGB * y_cb_cr;
 }
+
+// --- surfaces RGBA passthrough --- //
+// Samples a single RGBA texture and outputs the color directly.
+// Uses instance-based storage buffer for bounds / content_mask,
+// and per-surface bind groups for the texture + sampler.
+
+struct SurfaceInstance {
+    bounds: Bounds,
+    content_mask: Bounds,
+}
+
+@group(1) @binding(0) var<storage, read> b_surface_instances: array<SurfaceInstance>;
+@group(1) @binding(1) var surface_rgba_texture: texture_2d<f32>;
+@group(1) @binding(2) var surface_rgba_sampler: sampler;
+
+@vertex
+fn vs_surface_rgba(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> SurfaceVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let surface = b_surface_instances[instance_id];
+
+    var out = SurfaceVarying();
+    out.position = to_device_position(unit_vertex, surface.bounds);
+    out.texture_position = unit_vertex;
+    out.clip_distances = distance_from_clip_rect(unit_vertex, surface.bounds, surface.content_mask);
+    return out;
+}
+
+@fragment
+fn fs_surface_rgba(input: SurfaceVarying) -> @location(0) vec4<f32> {
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+    return textureSample(surface_rgba_texture, surface_rgba_sampler, input.texture_position);
+}

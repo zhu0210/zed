@@ -7,9 +7,9 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite, PaintSurface,
-    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
-    Surface, Underline, point, size,
+    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, GpuTextureFormat,
+    MonochromeSprite, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad,
+    ScaledPixels, Scene, Shadow, Size, Surface, Underline, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -1488,38 +1488,68 @@ impl MetalRenderer {
         );
 
         for surface in surfaces {
+            let (image_buffer, format) = match &surface.content {
+                gpui::SurfaceContent::CvPixelBuffer(pixel_buffer) => {
+                    let format = match pixel_buffer.get_pixel_format() {
+                        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange => GpuTextureFormat::Nv12,
+                        pf => panic!(
+                            "Unsupported CVPixelBuffer pixel format in Metal renderer: {pf:#x}"
+                        ),
+                    };
+                    (pixel_buffer.clone(), format)
+                }
+                _ => continue,
+            };
+
             let texture_size = size(
-                DevicePixels::from(surface.image_buffer.get_width() as i32),
-                DevicePixels::from(surface.image_buffer.get_height() as i32),
+                DevicePixels::from(image_buffer.get_width() as i32),
+                DevicePixels::from(image_buffer.get_height() as i32),
             );
 
-            assert_eq!(
-                surface.image_buffer.get_pixel_format(),
-                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-            );
+            match format {
+                GpuTextureFormat::Nv12 => {
+                    let y_texture = self
+                        .core_video_texture_cache
+                        .create_texture_from_image(
+                            image_buffer.as_concrete_TypeRef(),
+                            None,
+                            MTLPixelFormat::R8Unorm,
+                            image_buffer.get_width_of_plane(0),
+                            image_buffer.get_height_of_plane(0),
+                            0,
+                        )
+                        .unwrap();
+                    let cb_cr_texture = self
+                        .core_video_texture_cache
+                        .create_texture_from_image(
+                            image_buffer.as_concrete_TypeRef(),
+                            None,
+                            MTLPixelFormat::RG8Unorm,
+                            image_buffer.get_width_of_plane(1),
+                            image_buffer.get_height_of_plane(1),
+                            1,
+                        )
+                        .unwrap();
 
-            let y_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
-                    None,
-                    MTLPixelFormat::R8Unorm,
-                    surface.image_buffer.get_width_of_plane(0),
-                    surface.image_buffer.get_height_of_plane(0),
-                    0,
-                )
-                .unwrap();
-            let cb_cr_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
-                    None,
-                    MTLPixelFormat::RG8Unorm,
-                    surface.image_buffer.get_width_of_plane(1),
-                    surface.image_buffer.get_height_of_plane(1),
-                    1,
-                )
-                .unwrap();
+                    command_encoder.set_fragment_texture(
+                        SurfaceInputIndex::YTexture as u64,
+                        unsafe {
+                            let texture =
+                                CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
+                            Some(metal::TextureRef::from_ptr(texture as *mut _))
+                        },
+                    );
+                    command_encoder.set_fragment_texture(
+                        SurfaceInputIndex::CbCrTexture as u64,
+                        unsafe {
+                            let texture =
+                                CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
+                            Some(metal::TextureRef::from_ptr(texture as *mut _))
+                        },
+                    );
+                }
+                _ => continue,
+            }
 
             align_offset(instance_offset);
             let next_offset = *instance_offset + mem::size_of::<Surface>();
@@ -1537,15 +1567,6 @@ impl MetalRenderer {
                 mem::size_of_val(&texture_size) as u64,
                 &texture_size as *const Size<DevicePixels> as *const _,
             );
-            // let y_texture = y_texture.get_texture().unwrap().
-            command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
-                Some(metal::TextureRef::from_ptr(texture as *mut _))
-            });
-            command_encoder.set_fragment_texture(SurfaceInputIndex::CbCrTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
-                Some(metal::TextureRef::from_ptr(texture as *mut _))
-            });
 
             unsafe {
                 let buffer_contents = (instance_buffer.metal_buffer.contents() as *mut u8)

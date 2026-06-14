@@ -13,6 +13,7 @@ use std::{
     iter::Peekable,
     ops::{Add, Range, Sub},
     slice,
+    sync::Arc,
 };
 
 #[allow(non_camel_case_types, unused)]
@@ -715,14 +716,29 @@ impl From<PolychromeSprite> for Primitive {
     }
 }
 
+/// The content backing a PaintSurface — either a CVPixelBuffer (macOS direct
+/// path) or a wgpu texture (cross-platform).
 #[derive(Clone, Debug)]
-#[allow(missing_docs)]
+pub enum SurfaceContent {
+    /// macOS direct CVPixelBuffer (no pre-registration needed).
+    #[cfg(target_os = "macos")]
+    CvPixelBuffer(core_video::pixel_buffer::CVPixelBuffer),
+    /// Cross-platform wgpu texture. The [`Arc`] owns the GPU resource —
+    /// no separate unregistration step is needed.
+    #[cfg(feature = "wgpu")]
+    WgpuTexture(Arc<wgpu::Texture>),
+}
+
+/// A GPU texture composited into the scene.
+///
+/// Carries either a CVPixelBuffer (macOS direct path) or an Arc<wgpu::Texture>
+/// (cross-platform).
+#[derive(Clone, Debug)]
 pub struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
-    #[cfg(target_os = "macos")]
-    pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    pub content: SurfaceContent,
 }
 
 impl From<PaintSurface> for Primitive {

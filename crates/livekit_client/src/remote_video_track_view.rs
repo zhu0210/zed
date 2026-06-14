@@ -7,9 +7,7 @@ use gpui::{
 pub struct RemoteVideoTrackView {
     track: RemoteVideoTrack,
     latest_frame: Option<crate::RemoteVideoFrame>,
-    #[cfg(not(target_os = "macos"))]
     current_rendered_frame: Option<crate::RemoteVideoFrame>,
-    #[cfg(not(target_os = "macos"))]
     previous_rendered_frame: Option<crate::RemoteVideoFrame>,
     _maintain_frame: Task<()>,
 }
@@ -24,7 +22,6 @@ impl RemoteVideoTrackView {
         cx.focus_handle();
         let frames = crate::play_remote_video_track(&track, cx.background_executor());
 
-        #[cfg(not(target_os = "macos"))]
         {
             use util::ResultExt;
 
@@ -59,9 +56,7 @@ impl RemoteVideoTrackView {
                 this.update(cx, |_this, cx| cx.emit(RemoteVideoTrackViewEvent::Close))
                     .ok();
             }),
-            #[cfg(not(target_os = "macos"))]
             current_rendered_frame: None,
-            #[cfg(not(target_os = "macos"))]
             previous_rendered_frame: None,
         }
     }
@@ -75,15 +70,6 @@ impl EventEmitter<RemoteVideoTrackViewEvent> for RemoteVideoTrackView {}
 
 impl Render for RemoteVideoTrackView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        #[cfg(target_os = "macos")]
-        if let Some(latest_frame) = &self.latest_frame {
-            use gpui::Styled as _;
-            return gpui::surface(latest_frame.clone())
-                .size_full()
-                .into_any_element();
-        }
-
-        #[cfg(not(target_os = "macos"))]
         if let Some(latest_frame) = &self.latest_frame {
             use gpui::Styled as _;
             if let Some(current_rendered_frame) = self.current_rendered_frame.take() {

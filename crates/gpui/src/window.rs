@@ -4092,12 +4092,14 @@ impl Window {
         Ok(())
     }
 
-    /// Paint a surface into the scene for the next frame at the current z-index.
+    /// Paint a CoreVideo pixel buffer directly into the scene (macOS only).
     ///
-    /// This method should only be called as part of the paint phase of element drawing.
+    /// This is the zero-copy path — no pre-registration needed. The pixel buffer
+    /// is imported directly by the renderer via CVMetalTextureCache (Metal backend)
+    /// or IOSurface→Metal→wgpu interop (wgpu backend).
     #[cfg(target_os = "macos")]
     pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: CVPixelBuffer) {
-        use crate::PaintSurface;
+        use crate::{PaintSurface, SurfaceContent};
 
         self.invalidator.debug_assert_paint();
 
@@ -4107,10 +4109,69 @@ impl Window {
             order: 0,
             bounds,
             content_mask,
-            image_buffer,
+            content: SurfaceContent::CvPixelBuffer(image_buffer),
         });
     }
 
+    /// Paint a wgpu texture into the scene (cross-platform).
+    ///
+    /// The texture is sampled directly by the renderer. The [`Arc`] reference
+    /// is held by the scene for one frame — no registration or unregistration
+    /// is needed.
+    ///
+    /// This is a low-level API. Most callers should use the [`surface()`] element.
+    #[cfg(feature = "wgpu")]
+    pub fn paint_surface_with_texture(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        texture: Arc<wgpu::Texture>,
+    ) {
+        use crate::{PaintSurface, SurfaceContent};
+
+        self.invalidator.debug_assert_paint();
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            content: SurfaceContent::WgpuTexture(texture),
+        });
+    }
+}
+
+/// Convert a CVPixelBuffer pixel format code to a GPUI [`GpuTextureFormat`].
+#[cfg(target_os = "macos")]
+fn cv_pixel_format_to_gpu_format(pixel_format: u32) -> crate::GpuTextureFormat {
+    use core_video::pixel_buffer::{
+        kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+    };
+    match pixel_format {
+        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        | kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange => crate::GpuTextureFormat::Nv12,
+        kCVPixelFormatType_32BGRA => crate::GpuTextureFormat::Bgra8Unorm,
+        other => panic!(
+            "Unsupported CVPixelBuffer pixel format: {other:#x}. \
+             Expected NV12 (420YpCbCr8BiPlanar) or 32BGRA."
+        ),
+    }
+}
+
+/// Build a descriptor from a CVPixelBuffer for [`ObjectFit`] sizing.
+#[cfg(target_os = "macos")]
+fn cv_pixel_buffer_descriptor(pixel_buffer: &CVPixelBuffer) -> crate::GpuTextureDescriptor {
+    crate::GpuTextureDescriptor {
+        size: crate::size(
+            crate::DevicePixels::from(pixel_buffer.get_width() as i32),
+            crate::DevicePixels::from(pixel_buffer.get_height() as i32),
+        ),
+        format: cv_pixel_format_to_gpu_format(pixel_buffer.get_pixel_format()),
+        color_space: crate::GpuTextureColorSpace::Srgb,
+    }
+}
+
+impl Window {
     /// Removes an image from the sprite atlas.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
         for frame_index in 0..data.frame_count() {

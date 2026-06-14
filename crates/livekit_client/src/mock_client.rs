@@ -19,18 +19,8 @@ pub use test::{ConnectionState, ParticipantIdentity, RtcStats, SessionStats, Tra
 
 pub struct AudioStream {}
 
-#[cfg(not(target_os = "macos"))]
 pub type RemoteVideoFrame = std::sync::Arc<gpui::RenderImage>;
 
-#[cfg(target_os = "macos")]
-#[derive(Clone)]
-pub(crate) struct RemoteVideoFrame {}
-#[cfg(target_os = "macos")]
-impl Into<gpui::SurfaceSource> for RemoteVideoFrame {
-    fn into(self) -> gpui::SurfaceSource {
-        unimplemented!()
-    }
-}
 pub(crate) fn play_remote_video_track(
     _track: &crate::RemoteVideoTrack,
     _: &gpui::BackgroundExecutor,
