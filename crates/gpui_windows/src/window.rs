@@ -160,7 +160,7 @@ impl WindowsWindowState {
         display: WindowsDisplay,
         min_size: Option<Size<Pixels>>,
         appearance: WindowAppearance,
-        disable_direct_composition: bool,
+        #[cfg(not(feature = "wgpu-renderer"))] disable_direct_composition: bool,
         #[cfg(not(feature = "wgpu-renderer"))] invalidate_devices: Arc<AtomicBool>,
         draw_coordinator: Rc<DrawCoordinator>,
     ) -> Result<Self> {
@@ -169,10 +169,18 @@ impl WindowsWindowState {
             monitor_dpi / USER_DEFAULT_SCREEN_DPI as f32
         };
         let origin = logical_point(window_params.x as f32, window_params.y as f32, scale_factor);
-        let physical_size = size(
-            DevicePixels(window_params.cx),
-            DevicePixels(window_params.cy),
-        );
+        let physical_size = {
+            let mut rect = RECT::default();
+
+            unsafe {
+                GetClientRect(hwnd, &mut rect)?;
+            }
+
+            size(
+                DevicePixels(rect.right - rect.left),
+                DevicePixels(rect.bottom - rect.top),
+            )
+        };
         let logical_size = physical_size.to_pixels(scale_factor);
         let fullscreen_restore_bounds = Bounds {
             origin,
@@ -327,6 +335,7 @@ impl WindowsWindowInner {
             context.display,
             context.min_size,
             context.appearance,
+            #[cfg(not(feature = "wgpu-renderer"))]
             context.disable_direct_composition,
         )?;
 
@@ -475,6 +484,7 @@ struct WindowCreateContext {
     main_receiver: PriorityQueueReceiver<RunnableVariant>,
     platform_window_handle: HWND,
     appearance: WindowAppearance,
+    #[cfg(not(feature = "wgpu-renderer"))]
     disable_direct_composition: bool,
     #[cfg(not(feature = "wgpu-renderer"))]
     invalidate_devices: Arc<AtomicBool>,
@@ -596,6 +606,7 @@ impl WindowsWindow {
             main_receiver,
             platform_window_handle,
             appearance,
+            #[cfg(not(feature = "wgpu-renderer"))]
             disable_direct_composition,
             #[cfg(not(feature = "wgpu-renderer"))]
             invalidate_devices,
