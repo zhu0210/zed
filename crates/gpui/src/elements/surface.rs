@@ -24,6 +24,13 @@ pub enum SurfaceSource {
         /// fills the layout bounds (ignoring aspect ratio).
         native_size: Option<Size<DevicePixels>>,
     },
+    /// Two-plane NV12 wgpu texture (Y plane R8Unorm + CbCr plane Rg8Unorm).
+    #[cfg(feature = "wgpu")]
+    Nv12Texture {
+        y_texture: Arc<wgpu::Texture>,
+        cb_cr_texture: Arc<wgpu::Texture>,
+        native_size: Size<DevicePixels>,
+    },
 }
 
 #[cfg(target_os = "macos")]
@@ -60,6 +67,29 @@ impl From<(Arc<wgpu::Texture>, Option<Size<DevicePixels>>)> for SurfaceSource {
     ) -> Self {
         SurfaceSource::Texture {
             texture,
+            native_size,
+        }
+    }
+}
+
+#[cfg(feature = "wgpu")]
+impl
+    From<(
+        Arc<wgpu::Texture>,
+        Arc<wgpu::Texture>,
+        Size<DevicePixels>,
+    )> for SurfaceSource
+{
+    fn from(
+        (y_texture, cb_cr_texture, native_size): (
+            Arc<wgpu::Texture>,
+            Arc<wgpu::Texture>,
+            Size<DevicePixels>,
+        ),
+    ) -> Self {
+        SurfaceSource::Nv12Texture {
+            y_texture,
+            cb_cr_texture,
             native_size,
         }
     }
@@ -152,6 +182,13 @@ impl Element for Surface {
                     style.aspect_ratio = Some(size.width.0 as f32 / size.height.0 as f32);
                 }
             }
+            #[cfg(feature = "wgpu")]
+            SurfaceSource::Nv12Texture { native_size, .. } => {
+                if native_size.height.0 > 0 {
+                    style.aspect_ratio =
+                        Some(native_size.width.0 as f32 / native_size.height.0 as f32);
+                }
+            }
             _ => {}
         }
 
@@ -223,6 +260,21 @@ impl Element for Surface {
                         native_size: None,
                     } => {
                         window.paint_surface_with_texture(bounds, texture.clone());
+                    }
+                    #[cfg(feature = "wgpu")]
+                    SurfaceSource::Nv12Texture {
+                        y_texture,
+                        cb_cr_texture,
+                        native_size,
+                    } => {
+                        let paint_bounds =
+                            self.object_fit.get_bounds(bounds, *native_size);
+                        window.paint_surface_with_nv12_texture(
+                            paint_bounds,
+                            y_texture.clone(),
+                            cb_cr_texture.clone(),
+                            *native_size,
+                        );
                     }
                     #[allow(unreachable_patterns)]
                     _ => {}
