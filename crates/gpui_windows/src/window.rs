@@ -104,6 +104,8 @@ pub struct WindowsWindowState {
     pub direct_manipulation: DirectManipulationHandler,
 
     pub renderer: RefCell<RendererType>,
+    #[cfg(feature = "wgpu-renderer")]
+    pub gpu_context: GpuContext,
     #[cfg(not(feature = "wgpu-renderer"))]
     /// Set after a GPU device-lost recovery so the next `draw_window` call is
     /// treated as a forced render. This guarantees the next frame both
@@ -227,6 +229,8 @@ impl WindowsWindowState {
             last_reported_capslock: Cell::new(last_reported_capslock),
             hovered: Cell::new(hovered),
             renderer: RefCell::new(renderer),
+            #[cfg(feature = "wgpu-renderer")]
+            gpu_context,
             #[cfg(not(feature = "wgpu-renderer"))]
             force_render_after_recovery: Cell::new(false),
             click_state,
@@ -1062,6 +1066,20 @@ impl PlatformWindow for WindowsWindow {
         {
             Some(self.state.renderer.borrow().gpu_specs())
         }
+    }
+
+    #[cfg(feature = "wgpu-renderer")]
+    fn gpu_context(&self) -> Option<GpuContextHandle> {
+        let gpu_ctx = self.state.gpu_context.borrow();
+        let wgpu = gpu_ctx.as_ref()?;
+        Some(GpuContextHandle {
+            device: wgpu.device.clone(),
+            queue: wgpu.queue.clone(),
+            instance: wgpu.instance.clone(),
+            adapter: wgpu.adapter.clone(),
+            color_texture_format: wgpu.color_texture_format(),
+            supports_dual_source_blending: wgpu.supports_dual_source_blending(),
+        })
     }
 
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {

@@ -94,6 +94,17 @@ pub(crate) trait LinuxClient {
     fn window_stack(&self) -> Option<Vec<AnyWindowHandle>>;
     fn run(&self);
 
+    /// Returns a handle to the GPU resources, if available.
+    fn gpu_context(&self) -> Option<gpui::GpuContextHandle> {
+        None
+    }
+
+    /// Inject a pre-existing wgpu device. Returns an error if the GPU
+    /// context is already initialized.
+    fn set_gpu_context(&self, _handle: gpui::GpuContextHandle) -> anyhow::Result<()> {
+        anyhow::bail!("set_gpu_context is not supported on this platform")
+    }
+
     #[cfg(any(feature = "wayland", feature = "x11"))]
     fn window_identifier(
         &self,
@@ -641,6 +652,14 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
     }
 
     fn add_recent_document(&self, _path: &Path) {}
+
+    fn gpu_context(&self) -> Option<gpui::GpuContextHandle> {
+        self.inner.gpu_context()
+    }
+
+    fn set_gpu_context(&self, handle: gpui::GpuContextHandle) -> anyhow::Result<()> {
+        self.inner.set_gpu_context(handle)
+    }
 }
 
 #[cfg(any(feature = "wayland", feature = "x11"))]

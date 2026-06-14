@@ -59,12 +59,12 @@ use crate::linux::{
 use crate::linux::{LinuxCommon, LinuxKeyboardLayout, X11Window, modifiers_from_xinput_info};
 
 use gpui::{
-    AnyWindowHandle, Bounds, ClipboardItem, CursorStyle, DisplayId, FileDropEvent, Keystroke,
-    Modifiers, ModifiersChangedEvent, MouseButton, Pixels, PlatformDisplay, PlatformInput,
-    PlatformKeyboardLayout, PlatformWindow, Point, RequestFrameOptions, ScrollDelta, Size,
-    TouchPhase, WindowButtonLayout, WindowParams, point, px,
+    AnyWindowHandle, Bounds, ClipboardItem, CursorStyle, DisplayId, FileDropEvent, GpuContextHandle,
+    Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, Pixels, PlatformDisplay,
+    PlatformInput, PlatformKeyboardLayout, PlatformWindow, Point, RequestFrameOptions, ScrollDelta,
+    Size, TouchPhase, WindowButtonLayout, WindowParams, point, px,
 };
-use gpui_wgpu::{CompositorGpuHint, GpuContext};
+use gpui_wgpu::{CompositorGpuHint, GpuContext, WgpuContext};
 
 /// Value for DeviceId parameters which selects all devices.
 pub(crate) const XINPUT_ALL_DEVICES: xinput::DeviceId = 0;
@@ -1847,6 +1847,32 @@ impl LinuxClient for X11Client {
             .map(|window| window.window.x_window as u64)
             .map(|x_window| std::future::ready(Some(WindowIdentifier::from_xid(x_window))))
             .unwrap_or(std::future::ready(None))
+    }
+
+    fn gpu_context(&self) -> Option<GpuContextHandle> {
+        let state = self.0.borrow();
+        let wgpu = state.gpu_context.borrow();
+        let wgpu = wgpu.as_ref()?;
+        Some(GpuContextHandle {
+            device: wgpu.device.clone(),
+            queue: wgpu.queue.clone(),
+            instance: wgpu.instance.clone(),
+            adapter: wgpu.adapter.clone(),
+            color_texture_format: wgpu.color_texture_format(),
+            supports_dual_source_blending: wgpu.supports_dual_source_blending(),
+        })
+    }
+
+    fn set_gpu_context(&self, handle: GpuContextHandle) -> anyhow::Result<()> {
+        let state = self.0.borrow();
+        if state.gpu_context.borrow().is_some() {
+            anyhow::bail!(
+                "GPU context already initialized. Call `set_gpu_context` before opening any windows."
+            );
+        }
+        drop(state);
+        *self.0.borrow().gpu_context.borrow_mut() = Some(WgpuContext::from_handle(handle));
+        Ok(())
     }
 }
 

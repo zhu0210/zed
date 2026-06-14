@@ -93,13 +93,13 @@ use crate::linux::{
 };
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, CursorStyle, DevicePixels, DisplayId, FileDropEvent,
-    ForegroundExecutor, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
-    Pixels, PlatformDisplay, PlatformInput, PlatformKeyboardLayout, PlatformWindow, Point,
-    ScrollDelta, ScrollWheelEvent, SharedString, Size, TouchPhase, WindowButtonLayout,
-    WindowParams, point, profiler, px, size,
+    ForegroundExecutor, GpuContextHandle, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
+    MouseUpEvent, NavigationDirection, Pixels, PlatformDisplay, PlatformInput,
+    PlatformKeyboardLayout, PlatformWindow, Point, ScrollDelta, ScrollWheelEvent, SharedString,
+    Size, TouchPhase, WindowButtonLayout, WindowParams, point, profiler, px, size,
 };
-use gpui_wgpu::{CompositorGpuHint, GpuContext};
+use gpui_wgpu::{CompositorGpuHint, GpuContext, WgpuContext};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
 };
@@ -1017,6 +1017,32 @@ impl LinuxClient for WaylandClient {
         let client_state = self.0.borrow();
         let active_window = client_state.keyboard_focused_window.as_ref();
         inner(active_window.map(|aw| aw.surface()))
+    }
+
+    fn gpu_context(&self) -> Option<GpuContextHandle> {
+        let state = self.0.borrow();
+        let wgpu = state.gpu_context.borrow();
+        let wgpu = wgpu.as_ref()?;
+        Some(GpuContextHandle {
+            device: wgpu.device.clone(),
+            queue: wgpu.queue.clone(),
+            instance: wgpu.instance.clone(),
+            adapter: wgpu.adapter.clone(),
+            color_texture_format: wgpu.color_texture_format(),
+            supports_dual_source_blending: wgpu.supports_dual_source_blending(),
+        })
+    }
+
+    fn set_gpu_context(&self, handle: GpuContextHandle) -> anyhow::Result<()> {
+        let state = self.0.borrow();
+        if state.gpu_context.borrow().is_some() {
+            anyhow::bail!(
+                "GPU context already initialized. Call `set_gpu_context` before opening any windows."
+            );
+        }
+        drop(state);
+        *self.0.borrow().gpu_context.borrow_mut() = Some(WgpuContext::from_handle(handle));
+        Ok(())
     }
 }
 

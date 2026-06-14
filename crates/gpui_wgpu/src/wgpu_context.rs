@@ -444,6 +444,39 @@ impl WgpuContext {
     pub(crate) fn device_lost_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.device_lost)
     }
+
+    /// Create a `WgpuContext` from a pre-existing wgpu device.
+    ///
+    /// Used when embedding GPUI in an application that already owns a
+    /// wgpu device — the caller constructs a [`gpui::GpuContextHandle`]
+    /// with their device/instance/adapter/queue and passes it to
+    /// [`Platform::set_gpu_context()`], which calls this constructor.
+    ///
+    /// The caller is responsible for ensuring that the adapter is
+    /// compatible with the window surfaces GPUI will create.
+    /// Compatibility is verified per-window in `WgpuRenderer::new()`
+    /// via [`WgpuContext::check_compatible_with_surface`].
+    pub fn from_handle(handle: gpui::GpuContextHandle) -> Self {
+        let device_lost = Arc::new(AtomicBool::new(false));
+        handle.device.set_device_lost_callback({
+            let device_lost = Arc::clone(&device_lost);
+            move |reason, message| {
+                log::error!("wgpu device lost: reason={reason:?}, message={message}");
+                if reason != wgpu::DeviceLostReason::Destroyed {
+                    device_lost.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+        Self {
+            instance: handle.instance,
+            adapter: handle.adapter,
+            device: handle.device,
+            queue: handle.queue,
+            dual_source_blending: handle.supports_dual_source_blending,
+            color_texture_format: handle.color_texture_format,
+            device_lost,
+        }
+    }
 }
 
 #[cfg(not(target_family = "wasm"))]

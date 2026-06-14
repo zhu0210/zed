@@ -501,6 +501,8 @@ struct MacWindowState {
     cursor_visible: Arc<AtomicBool>,
     display_link: Option<DisplayLink>,
     renderer: renderer::Renderer,
+    #[cfg(feature = "wgpu-renderer")]
+    renderer_context: renderer::Context,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
     activate_callback: Option<Box<dyn FnMut(bool)>>,
@@ -908,6 +910,8 @@ impl MacWindow {
                     bounds.size.map(|pixels| pixels.as_f32()),
                     false,
                 ),
+                #[cfg(feature = "wgpu-renderer")]
+                renderer_context: renderer_context.clone(),
                 #[cfg(feature = "wgpu-renderer")]
                 renderer: renderer::Renderer::new(
                     renderer_context,
@@ -1771,6 +1775,21 @@ impl PlatformWindow for MacWindow {
 
     fn gpu_specs(&self) -> Option<gpui::GpuSpecs> {
         None
+    }
+
+    #[cfg(feature = "wgpu-renderer")]
+    fn gpu_context(&self) -> Option<gpui::GpuContextHandle> {
+        let lock = self.0.lock();
+        let gpu_ctx = lock.renderer_context.borrow();
+        let wgpu = gpu_ctx.as_ref()?;
+        Some(gpui::GpuContextHandle {
+            device: wgpu.device.clone(),
+            queue: wgpu.queue.clone(),
+            instance: wgpu.instance.clone(),
+            adapter: wgpu.adapter.clone(),
+            color_texture_format: wgpu.color_texture_format(),
+            supports_dual_source_blending: wgpu.supports_dual_source_blending(),
+        })
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {

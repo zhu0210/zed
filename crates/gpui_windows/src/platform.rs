@@ -918,6 +918,33 @@ impl Platform for WindowsPlatform {
     ) -> Task<Vec<SmallVec<[PathBuf; 2]>>> {
         self.update_jump_list(menus, entries)
     }
+
+    #[cfg(feature = "wgpu-renderer")]
+    fn gpu_context(&self) -> Option<GpuContextHandle> {
+        let gpu_ctx = self.inner.state.gpu_context.borrow();
+        let wgpu = gpu_ctx.as_ref()?;
+        Some(GpuContextHandle {
+            device: wgpu.device.clone(),
+            queue: wgpu.queue.clone(),
+            instance: wgpu.instance.clone(),
+            adapter: wgpu.adapter.clone(),
+            color_texture_format: wgpu.color_texture_format(),
+            supports_dual_source_blending: wgpu.supports_dual_source_blending(),
+        })
+    }
+
+    #[cfg(feature = "wgpu-renderer")]
+    fn set_gpu_context(&self, handle: GpuContextHandle) -> anyhow::Result<()> {
+        let gpu_ctx = self.inner.state.gpu_context.borrow();
+        if gpu_ctx.is_some() {
+            anyhow::bail!(
+                "GPU context already initialized. Call `set_gpu_context` before opening any windows."
+            );
+        }
+        drop(gpu_ctx);
+        *self.inner.state.gpu_context.borrow_mut() = Some(WgpuContext::from_handle(handle));
+        Ok(())
+    }
 }
 
 impl WindowsPlatformInner {

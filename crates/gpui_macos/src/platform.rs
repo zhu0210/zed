@@ -27,6 +27,8 @@ use core_foundation::{
 use ctor::ctor;
 use dispatch2::DispatchQueue;
 use futures::channel::oneshot;
+#[cfg(feature = "wgpu-renderer")]
+use gpui_wgpu::WgpuContext;
 use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor,
     KeyContext, Keymap, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions, Platform,
@@ -455,6 +457,35 @@ impl MacPlatform {
             version.minorVersion,
             version.patchVersion,
         )
+    }
+
+    #[cfg(feature = "wgpu-renderer")]
+    fn gpu_context(&self) -> Option<gpui::GpuContextHandle> {
+        let guard = self.0.lock();
+        let gpu_ctx = guard.renderer_context.borrow();
+        let wgpu = gpu_ctx.as_ref()?;
+        Some(gpui::GpuContextHandle {
+            device: wgpu.device.clone(),
+            queue: wgpu.queue.clone(),
+            instance: wgpu.instance.clone(),
+            adapter: wgpu.adapter.clone(),
+            color_texture_format: wgpu.color_texture_format(),
+            supports_dual_source_blending: wgpu.supports_dual_source_blending(),
+        })
+    }
+
+    #[cfg(feature = "wgpu-renderer")]
+    fn set_gpu_context(&self, handle: gpui::GpuContextHandle) -> anyhow::Result<()> {
+        let mut guard = self.0.lock();
+        let gpu_ctx = guard.renderer_context.borrow();
+        if gpu_ctx.is_some() {
+            anyhow::bail!(
+                "GPU context already initialized. Call `set_gpu_context` before opening any windows."
+            );
+        }
+        drop(gpu_ctx);
+        *guard.renderer_context.borrow_mut() = Some(WgpuContext::from_handle(handle));
+        Ok(())
     }
 }
 

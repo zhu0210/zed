@@ -913,6 +913,29 @@ impl App {
         subscription
     }
 
+    /// Inject a pre-existing wgpu device for GPUI to use.
+    ///
+    /// Must be called **before** opening any windows. All subsequent
+    /// windows will render with the provided device.
+    #[cfg(feature = "wgpu")]
+    pub fn set_gpu_context(&self, handle: crate::GpuContextHandle) -> anyhow::Result<()> {
+        self.platform.set_gpu_context(handle)
+    }
+
+    /// Inject a pre-existing wgpu device and queue for GPUI to use.
+    ///
+    /// Convenience wrapper around [`App::set_gpu_context()`] that creates
+    /// the instance and adapter automatically. Must be called **before**
+    /// opening any windows.
+    #[cfg(feature = "wgpu")]
+    pub fn set_gpu_device(
+        &self,
+        device: std::sync::Arc<wgpu::Device>,
+        queue: std::sync::Arc<wgpu::Queue>,
+    ) -> anyhow::Result<()> {
+        self.platform.set_gpu_device(device, queue)
+    }
+
     /// Gracefully quit the application via the platform's standard routine.
     pub fn quit(&self) {
         self.platform.quit();

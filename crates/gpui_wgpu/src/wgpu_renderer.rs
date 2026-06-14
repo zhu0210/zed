@@ -181,6 +181,24 @@ impl WgpuRenderer {
             .expect("GPU resources not available")
     }
 
+    /// Returns a handle to the GPU resources backing this renderer.
+    ///
+    /// Returns `None` if the GPU context has not been initialized yet
+    /// (before the first frame).
+    pub fn gpu_context_handle(&self) -> Option<gpui::GpuContextHandle> {
+        let gpu_ctx = self.context.as_ref()?;
+        let ctx = gpu_ctx.borrow();
+        let wgpu = ctx.as_ref()?;
+        Some(gpui::GpuContextHandle {
+            device: wgpu.device.clone(),
+            queue: wgpu.queue.clone(),
+            instance: wgpu.instance.clone(),
+            adapter: wgpu.adapter.clone(),
+            color_texture_format: wgpu.color_texture_format(),
+            supports_dual_source_blending: wgpu.supports_dual_source_blending(),
+        })
+    }
+
     /// Creates a new WgpuRenderer from raw window handles.
     ///
     /// The `gpu_context` is a shared reference that coordinates GPU context across

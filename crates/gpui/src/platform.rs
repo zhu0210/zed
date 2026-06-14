@@ -248,6 +248,103 @@ pub trait Platform: 'static {
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout>;
     fn keyboard_mapper(&self) -> Rc<dyn PlatformKeyboardMapper>;
     fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>);
+
+    /// Returns a handle to the GPU resources used by the renderer.
+    ///
+    /// Returns `None` when the platform uses a non-wgpu backend or before
+    /// any GPU resources have been initialized.
+    #[cfg(feature = "wgpu")]
+    fn gpu_context(&self) -> Option<GpuContextHandle> {
+        None
+    }
+
+    /// Inject a pre-existing wgpu device for GPUI to use.
+    ///
+    /// Must be called **before** opening any windows. After the first window
+    /// opens, the GPU context is frozen and this method will return an error.
+    ///
+    /// Use [`GpuContextHandle`] to bundle the device, instance, adapter, and
+    /// queue together.
+    #[cfg(feature = "wgpu")]
+    fn set_gpu_context(&self, _handle: GpuContextHandle) -> anyhow::Result<()> {
+        anyhow::bail!("set_gpu_context is not supported on this platform")
+    }
+
+    /// Inject a pre-existing wgpu device and queue for GPUI to use.
+    ///
+    /// Convenience wrapper around [`Platform::set_gpu_context()`] that
+    /// creates the [`wgpu::Instance`] and enumerates adapters automatically.
+    ///
+    /// Must be called **before** opening any windows.
+    #[cfg(feature = "wgpu")]
+    fn set_gpu_device(
+        &self,
+        device: std::sync::Arc<wgpu::Device>,
+        queue: std::sync::Arc<wgpu::Queue>,
+    ) -> anyhow::Result<()> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: None,
+        });
+
+        let adapters = crate::block_on(
+            instance.enumerate_adapters(wgpu::Backends::all()),
+        );
+
+        let adapter = adapters
+            .into_iter()
+            .find(|a| {
+                a.get_info().device_type != wgpu::DeviceType::Cpu
+            })
+            .ok_or_else(|| anyhow::anyhow!("No suitable GPU adapter found"))?;
+
+        let info = adapter.get_info();
+        let dual_source_blending = adapter
+            .features()
+            .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
+
+        let color_texture_format = {
+            let required_usages =
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
+            let bgra_features =
+                adapter.get_texture_format_features(wgpu::TextureFormat::Bgra8Unorm);
+            if bgra_features.allowed_usages.contains(required_usages) {
+                wgpu::TextureFormat::Bgra8Unorm
+            } else {
+                let rgba_features =
+                    adapter.get_texture_format_features(wgpu::TextureFormat::Rgba8Unorm);
+                if rgba_features.allowed_usages.contains(required_usages) {
+                    log::warn!(
+                        "Adapter {} ({:?}) does not support Bgra8Unorm; \
+                         falling back to Rgba8Unorm.",
+                        info.name,
+                        info.backend,
+                    );
+                    wgpu::TextureFormat::Rgba8Unorm
+                } else {
+                    anyhow::bail!(
+                        "Adapter {} ({:?}) does not support a usable color format.",
+                        info.name,
+                        info.backend,
+                    );
+                }
+            }
+        };
+
+        let handle = GpuContextHandle {
+            device,
+            queue,
+            instance,
+            adapter,
+            color_texture_format,
+            supports_dual_source_blending: dual_source_blending,
+        };
+
+        self.set_gpu_context(handle)
+    }
 }
 
 /// A handle to a platform's display, e.g. a monitor or laptop screen.
@@ -713,6 +810,16 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     fn set_client_inset(&self, _inset: Pixels) {}
     fn gpu_specs(&self) -> Option<GpuSpecs>;
+
+    /// Returns a handle to the GPU resources (device, instance, adapter, queue)
+    /// used by the renderer.
+    ///
+    /// Returns `None` when the platform uses a non-wgpu backend (DirectX, Metal)
+    /// or before GPU resources have been initialized by the first frame.
+    #[cfg(feature = "wgpu")]
+    fn gpu_context(&self) -> Option<GpuContextHandle> {
+        None
+    }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
 
@@ -1197,6 +1304,34 @@ pub enum GpuTextureFormat {
 pub enum GpuTextureColorSpace {
     #[default]
     Srgb,
+}
+
+/// Handle to the GPU resources backing the renderer.
+///
+/// Obtained via [`Window::gpu_context()`], [`AsyncApp::gpu_context()`], or
+/// [`AsyncWindowContext::gpu_context()`]. All [`wgpu::Texture`]s passed to
+/// [`surface()`] must be created on this device.
+///
+/// All fields are `Send + Sync` — the handle can be held across await points
+/// and sent to background threads for texture creation.
+#[cfg(feature = "wgpu")]
+#[derive(Clone)]
+pub struct GpuContextHandle {
+    /// The wgpu device. All GPUI rendering shares this device.
+    pub device: std::sync::Arc<wgpu::Device>,
+    /// The wgpu queue used for command submission.
+    pub queue: std::sync::Arc<wgpu::Queue>,
+    /// The wgpu instance. Needed for importing textures from external
+    /// sources (e.g., IOSurface, D3D shared handles).
+    pub instance: wgpu::Instance,
+    /// The wgpu adapter. Useful for querying feature support and limits.
+    pub adapter: wgpu::Adapter,
+    /// The color texture format used by the renderer's internal atlas and
+    /// surface. Textures created with this format will be most efficient.
+    pub color_texture_format: wgpu::TextureFormat,
+    /// Whether the device supports dual-source blending (enables subpixel
+    /// text antialiasing).
+    pub supports_dual_source_blending: bool,
 }
 
 #[expect(missing_docs)]

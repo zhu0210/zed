@@ -159,6 +159,44 @@ impl AsyncApp {
         &self.foreground_executor
     }
 
+    /// Returns a handle to the GPU resources used by the renderer.
+    ///
+    /// Returns `None` when the platform uses a non-wgpu backend or before
+    /// GPU resources have been initialized.
+    ///
+    /// The returned [`GpuContextHandle`] can be cloned and held across
+    /// await points for use in background texture creation tasks.
+    #[cfg(feature = "wgpu")]
+    pub fn gpu_context(&self) -> Option<crate::GpuContextHandle> {
+        self.update(|app| app.platform.gpu_context())
+    }
+
+    /// Inject a pre-existing wgpu device for GPUI to use.
+    ///
+    /// Must be called **before** opening any windows. All subsequent
+    /// windows will render with the provided device.
+    #[cfg(feature = "wgpu")]
+    pub fn set_gpu_context(
+        &self,
+        handle: crate::GpuContextHandle,
+    ) -> anyhow::Result<()> {
+        self.update(|app| app.platform.set_gpu_context(handle))
+    }
+
+    /// Inject a pre-existing wgpu device and queue for GPUI to use.
+    ///
+    /// Convenience wrapper around [`AsyncApp::set_gpu_context()`] that
+    /// creates the instance and adapter automatically. Must be called
+    /// **before** opening any windows.
+    #[cfg(feature = "wgpu")]
+    pub fn set_gpu_device(
+        &self,
+        device: std::sync::Arc<wgpu::Device>,
+        queue: std::sync::Arc<wgpu::Queue>,
+    ) -> anyhow::Result<()> {
+        self.update(|app| app.platform.set_gpu_device(device, queue))
+    }
+
     /// Invoke the given function in the context of the app, then flush any effects produced during its invocation.
     pub fn update<R>(&self, f: impl FnOnce(&mut App) -> R) -> R {
         let app = self.app();

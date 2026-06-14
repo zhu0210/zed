@@ -36,7 +36,7 @@ pub(crate) use dispatcher::*;
 pub(crate) use display::*;
 pub(crate) use events::*;
 #[cfg(feature = "wgpu-renderer")]
-pub(crate) use gpui_wgpu::{GpuContext, WgpuRenderer, WgpuSurfaceConfig};
+pub(crate) use gpui_wgpu::{GpuContext, WgpuContext, WgpuRenderer, WgpuSurfaceConfig};
 pub(crate) use keyboard::*;
 pub(crate) use platform::*;
 pub(crate) use system_settings::*;
