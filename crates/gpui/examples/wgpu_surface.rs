@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 struct SurfaceDemo {
     label: SharedString,
+    device_info: SharedString,
     #[cfg(feature = "wgpu")]
     triangle_texture: Option<Arc<wgpu::Texture>>,
     #[cfg(feature = "wgpu")]
@@ -286,10 +287,27 @@ impl Render for SurfaceDemo {
         #[cfg(feature = "wgpu")]
         if self.triangle_texture.is_none() || self.nv12_y_texture.is_none() {
             if let Some(gpu) = window.gpu_context() {
+                // Log device info once at startup.
                 if self.triangle_texture.is_none() {
+                    log::info!(
+                        "wgpu_surface demo: GPU device ready. \
+                         format={:?}, dual_source_blending={}",
+                        gpu.color_texture_format,
+                        gpu.supports_dual_source_blending
+                    );
+                    self.device_info = SharedString::from(format!(
+                        "wgpu device: color_format={:?}, dual_src_blend={}",
+                        gpu.color_texture_format,
+                        gpu.supports_dual_source_blending
+                    ));
                     self.triangle_texture = Some(create_triangle_texture(&gpu));
                 }
                 if self.nv12_y_texture.is_none() {
+                    log::info!(
+                        "wgpu_surface demo: creating NV12 test textures ({}×{})",
+                        NV12_TEX_WIDTH,
+                        NV12_TEX_HEIGHT
+                    );
                     let (y_tex, cb_cr_tex) = create_nv12_test_textures(&gpu);
                     self.nv12_y_texture = Some(y_tex);
                     self.nv12_cb_cr_texture = Some(cb_cr_tex);
@@ -319,6 +337,13 @@ impl Render for SurfaceDemo {
                     .text_sm()
                     .text_color(rgb(0xa6adc8))
                     .child(self.label.clone()),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x585b70))
+                    .font_family("monospace")
+                    .child(self.device_info.clone()),
             )
             .child(
                 // Row 1: RGBA8 triangle — Contain + Fill
@@ -499,19 +524,23 @@ impl Render for SurfaceDemo {
                     .text_sm()
                     .text_color(rgb(0xcdd6f4))
                     .font_family("monospace")
-                    .child("// RGBA8 texture — triangle via barycentric coords")
+                    .child("// --- RGBA8 texture (cross-platform) ---")
                     .child(format!(
                         "surface((texture.clone(), Some(descriptor.size)))  // {}×{}",
                         TEX_WIDTH, TEX_HEIGHT,
                     ))
                     .child("    .object_fit(ObjectFit::Contain)")
                     .child("")
-                    .child("// NV12 texture — Y + CbCr planes, YCbCr→RGB in shader")
+                    .child("// --- NV12 texture (Y + CbCr planes, YCbCr→RGB in WGSL) ---")
                     .child(format!(
                         "surface((y_tex.clone(), cb_cr_tex.clone(), size))  // {}×{}",
                         NV12_TEX_WIDTH, NV12_TEX_HEIGHT,
                     ))
-                    .child("    .object_fit(ObjectFit::Contain)"),
+                    .child("    .object_fit(ObjectFit::Contain)")
+                    .child("")
+                    .child("// --- feature flags ---")
+                    .child("// wgpu-renderer  : wgpu backend (default)")
+                    .child("// iosurface-interop : zero-copy CVPixelBuffer→wgpu (macOS)"),
             )
     }
 }
@@ -533,12 +562,13 @@ fn run_example() {
         "Row 1: RGBA8 triangle ({}×{}, barycentric).  \
          Row 2: NV12 Y+CbCr ({}×{}, colour bars).\n\
          All textures uploaded via queue.write_texture, composited via surface().\n\
-         Uses Window::gpu_context() to access the renderer's wgpu device.",
+         Uses Window::gpu_context() to access the renderer's wgpu device.\n\
+         Build with: cargo run -p gpui --example wgpu_surface",
         TEX_WIDTH, TEX_HEIGHT, NV12_TEX_WIDTH, NV12_TEX_HEIGHT,
     ));
 
     application().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(720.), px(660.0)), cx);
+        let bounds = Bounds::centered(None, size(px(720.), px(700.0)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -547,6 +577,7 @@ fn run_example() {
             |_, cx| {
                 cx.new(|_| SurfaceDemo {
                     label: label.clone(),
+                    device_info: SharedString::from("(no wgpu device yet)"),
                     #[cfg(feature = "wgpu")]
                     triangle_texture: None,
                     #[cfg(feature = "wgpu")]
