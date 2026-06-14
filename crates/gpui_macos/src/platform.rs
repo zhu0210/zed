@@ -1285,6 +1285,10 @@ impl Platform for MacPlatform {
 /// Import a [`core_video::pixel_buffer::CVPixelBuffer`] into a wgpu texture
 /// for compositing via [`gpui::surface`].
 ///
+/// Accepts a [`gpui::GpuContextHandle`] (obtained from
+/// [`gpui::Window::gpu_context()`]) so callers don't need access to the
+/// platform-internal `GpuContext` type.
+///
 /// When the `iosurface-interop` feature is enabled, tries the **zero-copy**
 /// IOSurface → Metal → wgpu path first. Falls back to a CPU copy if the
 /// pixel buffer has no IOSurface (software-decoded frame) or the wgpu
@@ -1306,18 +1310,15 @@ impl Platform for MacPlatform {
 #[cfg(feature = "wgpu-renderer")]
 pub fn import_cv_pixel_buffer_to_wgpu(
     pixel_buffer: &core_video::pixel_buffer::CVPixelBuffer,
-    gpu_context: &gpui_wgpu::GpuContext,
+    gpu_handle: &gpui::GpuContextHandle,
 ) -> Option<std::sync::Arc<gpui_wgpu::wgpu::Texture>> {
     use core_video::pixel_buffer::kCVPixelFormatType_32BGRA;
     use gpui_wgpu::wgpu;
 
-    let ctx = gpu_context.borrow();
-    let wgpu_ctx = ctx.as_ref()?;
-
     log::debug!(
-        "import_cv_pixel_buffer_to_wgpu: device={:?}, adapter={:?}",
-        wgpu_ctx.color_texture_format(),
-        wgpu_ctx.supports_dual_source_blending()
+        "import_cv_pixel_buffer_to_wgpu: format={:?}, dual_src_blend={}",
+        gpu_handle.color_texture_format,
+        gpu_handle.supports_dual_source_blending
     );
 
     let wgpu_format = match pixel_buffer.get_pixel_format() {
@@ -1342,7 +1343,7 @@ pub fn import_cv_pixel_buffer_to_wgpu(
     // Try zero-copy IOSurface import when the feature is enabled.
     #[cfg(feature = "iosurface-interop")]
     if let Some(texture) =
-        import_via_iosurface(pixel_buffer, wgpu_ctx, wgpu_format, width, height)
+        import_via_iosurface(pixel_buffer, gpu_handle, wgpu_format, width, height)
     {
         log::info!(
             "import_cv_pixel_buffer_to_wgpu: zero-copy IOSurface import succeeded ({}×{})",
@@ -1355,8 +1356,12 @@ pub fn import_cv_pixel_buffer_to_wgpu(
     log::debug!("import_cv_pixel_buffer_to_wgpu: IOSurface path unavailable, falling back to CPU copy");
 
     // CPU-copy fallback.
-    log::debug!("import_cv_pixel_buffer_to_wgpu: using CPU copy fallback ({}×{})", width, height);
-    import_via_cpu_copy(pixel_buffer, wgpu_ctx, wgpu_format, width, height)
+    log::debug!(
+        "import_cv_pixel_buffer_to_wgpu: using CPU copy fallback ({}×{})",
+        width,
+        height
+    );
+    import_via_cpu_copy(pixel_buffer, gpu_handle, wgpu_format, width, height)
         .map(std::sync::Arc::new)
 }
 
@@ -1369,7 +1374,7 @@ pub fn import_cv_pixel_buffer_to_wgpu(
 #[cfg(all(feature = "wgpu-renderer", feature = "iosurface-interop"))]
 fn import_via_iosurface(
     pixel_buffer: &core_video::pixel_buffer::CVPixelBuffer,
-    wgpu_ctx: &gpui_wgpu::WgpuContext,
+    gpu_handle: &gpui::GpuContextHandle,
     wgpu_format: gpui_wgpu::wgpu::TextureFormat,
     width: u32,
     height: u32,
@@ -1378,6 +1383,11 @@ fn import_via_iosurface(
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
     use objc2_metal::MTLTexture;
+
+    log::debug!(
+        "import_via_iosurface: trying IOSurface import via device {:?}",
+        gpu_handle.color_texture_format
+    );
 
     // Extract IOSurface from the CVPixelBuffer.
     let io_surface = unsafe {
@@ -1398,7 +1408,7 @@ fn import_via_iosurface(
     );
 
     // Access the Metal HAL device.
-    let metal_hal = match unsafe { wgpu_ctx.device.as_hal::<wgpu::hal::api::Metal>() } {
+    let metal_hal = match unsafe { gpu_handle.device.as_hal::<wgpu::hal::api::Metal>() } {
         Some(d) => d,
         None => {
             log::debug!(
@@ -1482,9 +1492,7 @@ fn import_via_iosurface(
     };
 
     let wgpu_texture = unsafe {
-        wgpu_ctx
-            .device
-            .create_texture_from_hal::<wgpu::hal::api::Metal>(hal_texture, &texture_desc)
+        gpu_handle.device.create_texture_from_hal::<wgpu::hal::api::Metal>(hal_texture, &texture_desc)
     };
 
     log::info!(
@@ -1501,7 +1509,7 @@ fn import_via_iosurface(
 #[cfg(feature = "wgpu-renderer")]
 fn import_via_cpu_copy(
     pixel_buffer: &core_video::pixel_buffer::CVPixelBuffer,
-    wgpu_ctx: &gpui_wgpu::WgpuContext,
+    gpu_handle: &gpui::GpuContextHandle,
     wgpu_format: gpui_wgpu::wgpu::TextureFormat,
     width: u32,
     height: u32,
@@ -1511,7 +1519,7 @@ fn import_via_cpu_copy(
 
     let bytes_per_row = pixel_buffer.get_bytes_per_row() as u32;
 
-    let texture = wgpu_ctx.device.create_texture(&wgpu::TextureDescriptor {
+    let texture = gpu_handle.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("cv_pixel_buffer_cpu_import"),
         size: wgpu::Extent3d {
             width,
@@ -1555,7 +1563,7 @@ fn import_via_cpu_copy(
         data.len()
     );
 
-    wgpu_ctx.queue.write_texture(
+    gpu_handle.queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture: &texture,
             mip_level: 0,

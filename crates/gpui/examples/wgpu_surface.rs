@@ -13,9 +13,9 @@
 
 use gpui::{
     App, Bounds, Context, DevicePixels, GpuContextHandle, GpuTextureColorSpace,
-    GpuTextureDescriptor, GpuTextureFormat, IntoElement, ObjectFit, ParentElement, Render,
-    SharedString, Styled, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb,
-    size, surface,
+    GpuTextureDescriptor, GpuTextureFormat, IntoElement, ObjectFit, ParentElement,
+    Render, SharedString, Styled, Window, WindowBounds, WindowOptions,
+    div, prelude::*, px, rgb, size, surface,
 };
 use gpui_platform::application;
 #[cfg(feature = "wgpu")]
@@ -287,27 +287,15 @@ impl Render for SurfaceDemo {
         #[cfg(feature = "wgpu")]
         if self.triangle_texture.is_none() || self.nv12_y_texture.is_none() {
             if let Some(gpu) = window.gpu_context() {
-                // Log device info once at startup.
+                self.device_info = SharedString::from(format!(
+                    "wgpu: {:?} dual_src={}",
+                    gpu.color_texture_format,
+                    gpu.supports_dual_source_blending
+                ));
                 if self.triangle_texture.is_none() {
-                    log::info!(
-                        "wgpu_surface demo: GPU device ready. \
-                         format={:?}, dual_source_blending={}",
-                        gpu.color_texture_format,
-                        gpu.supports_dual_source_blending
-                    );
-                    self.device_info = SharedString::from(format!(
-                        "wgpu device: color_format={:?}, dual_src_blend={}",
-                        gpu.color_texture_format,
-                        gpu.supports_dual_source_blending
-                    ));
                     self.triangle_texture = Some(create_triangle_texture(&gpu));
                 }
                 if self.nv12_y_texture.is_none() {
-                    log::info!(
-                        "wgpu_surface demo: creating NV12 test textures ({}×{})",
-                        NV12_TEX_WIDTH,
-                        NV12_TEX_HEIGHT
-                    );
                     let (y_tex, cb_cr_tex) = create_nv12_test_textures(&gpu);
                     self.nv12_y_texture = Some(y_tex);
                     self.nv12_cb_cr_texture = Some(cb_cr_tex);
@@ -510,37 +498,21 @@ impl Render for SurfaceDemo {
                             ),
                     ),
             )
-            .child(
-                // API info
+             .child(
+                // API info — one text block
                 div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .bg(rgb(0x313244))
                     .border_1()
                     .border_color(rgb(0x45475a))
                     .rounded_md()
                     .p_3()
                     .text_sm()
                     .text_color(rgb(0xcdd6f4))
-                    .font_family("monospace")
-                    .child("// --- RGBA8 texture (cross-platform) ---")
-                    .child(format!(
-                        "surface((texture.clone(), Some(descriptor.size)))  // {}×{}",
-                        TEX_WIDTH, TEX_HEIGHT,
-                    ))
-                    .child("    .object_fit(ObjectFit::Contain)")
-                    .child("")
-                    .child("// --- NV12 texture (Y + CbCr planes, YCbCr→RGB in WGSL) ---")
-                    .child(format!(
-                        "surface((y_tex.clone(), cb_cr_tex.clone(), size))  // {}×{}",
-                        NV12_TEX_WIDTH, NV12_TEX_HEIGHT,
-                    ))
-                    .child("    .object_fit(ObjectFit::Contain)")
-                    .child("")
-                    .child("// --- feature flags ---")
-                    .child("// wgpu-renderer  : wgpu backend (default)")
-                    .child("// iosurface-interop : zero-copy CVPixelBuffer→wgpu (macOS)"),
+                    .child(SharedString::from(format!(
+                        "Texture: {}×{} RGBA8 + {}×{} NV12  |  \
+                         ObjectFit::Contain / Fill  |  \
+                         surface((tex, desc)) / surface((y, cbcr, size))",
+                        TEX_WIDTH, TEX_HEIGHT, NV12_TEX_WIDTH, NV12_TEX_HEIGHT,
+                    ))),
             )
     }
 }
@@ -568,7 +540,7 @@ fn run_example() {
     ));
 
     application().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(720.), px(700.0)), cx);
+        let bounds = Bounds::centered(None, size(px(720.), px(800.0)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
