@@ -4193,7 +4193,7 @@ fn cv_pixel_format_to_gpu_format(pixel_format: u32) -> crate::GpuTextureFormat {
 
 /// Build a descriptor from a CVPixelBuffer for [`ObjectFit`] sizing.
 #[cfg(target_os = "macos")]
-fn cv_pixel_buffer_descriptor(pixel_buffer: &CVPixelBuffer) -> crate::GpuTextureDescriptor {
+pub fn cv_pixel_buffer_descriptor(pixel_buffer: &CVPixelBuffer) -> crate::GpuTextureDescriptor {
     crate::GpuTextureDescriptor {
         size: crate::size(
             crate::DevicePixels::from(pixel_buffer.get_width() as i32),

@@ -73,7 +73,7 @@ pub(crate) struct WindowsPlatformState {
     #[cfg(not(feature = "wgpu-renderer"))]
     directx_devices: RefCell<Option<DirectXDevices>>,
     #[cfg(feature = "wgpu-renderer")]
-    gpu_context: RefCell<Option<GpuContext>>,
+    gpu_context: GpuContext,
 }
 
 #[derive(Default)]
@@ -105,7 +105,7 @@ impl WindowsPlatformState {
     }
 
     #[cfg(feature = "wgpu-renderer")]
-    fn new(gpu_context: Option<GpuContext>) -> Self {
+    fn new() -> Self {
         let callbacks = PlatformCallbacks::default();
         let jump_list = JumpList::new();
         let current_cursor = load_cursor(CursorStyle::Arrow);
@@ -115,7 +115,7 @@ impl WindowsPlatformState {
             jump_list: RefCell::new(jump_list),
             current_cursor: Cell::new(current_cursor),
             cursor_visible: Arc::new(AtomicBool::new(true)),
-            gpu_context: RefCell::new(gpu_context),
+            gpu_context: Rc::new(RefCell::new(None)),
             menus: RefCell::new(Vec::new()),
         }
     }
@@ -147,18 +147,10 @@ impl WindowsPlatform {
         };
 
         #[cfg(feature = "wgpu-renderer")]
-        let (gpu_context, text_system) = if !headless {
-            let context = Rc::new(RefCell::new(None));
-            let text_system = Arc::new(gpui_wgpu::CosmicTextSystem::new("IBM Plex Sans"));
-            (
-                Some(context),
-                text_system.clone() as Arc<dyn PlatformTextSystem>,
-            )
+        let text_system: Arc<dyn PlatformTextSystem> = if !headless {
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("IBM Plex Sans"))
         } else {
-            (
-                None,
-                Arc::new(gpui::NoopTextSystem::new()) as Arc<dyn PlatformTextSystem>,
-            )
+            Arc::new(gpui::NoopTextSystem::new())
         };
 
         let (main_sender, main_receiver) = PriorityQueueReceiver::new();
@@ -187,7 +179,7 @@ impl WindowsPlatform {
             validation_number,
             main_sender: Some(main_sender),
             main_receiver: Some(main_receiver),
-            gpu_context,
+            gpu_context: None,
             dispatcher: None,
         };
         let result = unsafe {
@@ -285,7 +277,7 @@ impl WindowsPlatform {
             #[cfg(not(feature = "wgpu-renderer"))]
             directx_devices: self.inner.state.directx_devices.borrow().clone().unwrap(),
             #[cfg(feature = "wgpu-renderer")]
-            gpu_context: self.inner.state.gpu_context.borrow().clone().unwrap(),
+            gpu_context: self.inner.state.gpu_context.clone(),
             #[cfg(not(feature = "wgpu-renderer"))]
             invalidate_devices: self.invalidate_devices.clone(),
         }
@@ -921,8 +913,7 @@ impl Platform for WindowsPlatform {
 
     #[cfg(feature = "wgpu-renderer")]
     fn gpu_context(&self) -> Option<GpuContextHandle> {
-        let gpu_ctx = self.inner.state.gpu_context.borrow();
-        let wgpu = gpu_ctx.as_ref()?.borrow();
+        let wgpu = self.inner.state.gpu_context.borrow();
         let wgpu_ctx = wgpu.as_ref()?;
 
         Some(GpuContextHandle {
@@ -944,9 +935,7 @@ impl Platform for WindowsPlatform {
             );
         }
         drop(gpu_ctx);
-        *self.inner.state.gpu_context.borrow_mut() = Some(Rc::new(RefCell::new(Some(
-            WgpuContext::from_handle(handle),
-        ))));
+        *self.inner.state.gpu_context.borrow_mut() = Some(WgpuContext::from_handle(handle));
         Ok(())
     }
 }
@@ -956,7 +945,7 @@ impl WindowsPlatformInner {
         #[cfg(not(feature = "wgpu-renderer"))]
         let state = WindowsPlatformState::new(context.directx_devices.take());
         #[cfg(feature = "wgpu-renderer")]
-        let state = WindowsPlatformState::new(context.gpu_context.take());
+        let state = WindowsPlatformState::new();
         Ok(Rc::new(Self {
             state,
             raw_window_handles: context.raw_window_handles.clone(),
