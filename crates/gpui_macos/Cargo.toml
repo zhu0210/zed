@@ -14,6 +14,7 @@ path = "src/gpui_macos.rs"
 [features]
 default = ["gpui/default", "wgpu-renderer" ]
 wgpu-renderer = ["gpui/wgpu", "dep:gpui_wgpu"]
+iosurface-interop = ["dep:objc2-metal"]
 test-support = ["gpui/test-support"]
 runtime_shaders = []
 font-kit = ["dep:font-kit"]
@@ -63,6 +64,7 @@ strum.workspace = true
 util.workspace = true
 uuid.workspace = true
 gpui_wgpu = { workspace = true, optional = true }
+objc2-metal = { version = "0.3.2", optional = true }
 
 [target.'cfg(target_os = "macos")'.build-dependencies]
 cbindgen = { version = "0.28.0", default-features = false }
