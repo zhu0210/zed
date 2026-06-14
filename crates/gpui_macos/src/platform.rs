@@ -27,14 +27,14 @@ use core_foundation::{
 use ctor::ctor;
 use dispatch2::DispatchQueue;
 use futures::channel::oneshot;
-#[cfg(feature = "wgpu-renderer")]
-use gpui_wgpu::WgpuContext;
 use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor,
     KeyContext, Keymap, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions, Platform,
     PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
     PlatformWindow, Result, SystemMenuType, Task, ThermalState, WindowAppearance, WindowParams,
 };
+#[cfg(feature = "wgpu-renderer")]
+use gpui_wgpu::WgpuContext;
 use itertools::Itertools;
 use objc::{
     class,
@@ -1226,9 +1226,7 @@ pub fn import_cv_pixel_buffer_to_wgpu(
     let wgpu_format = match pixel_buffer.get_pixel_format() {
         kCVPixelFormatType_32BGRA => wgpu::TextureFormat::Bgra8Unorm,
         pf => {
-            log::warn!(
-                "import_cv_pixel_buffer_to_wgpu: unsupported pixel format {pf:#x}"
-            );
+            log::warn!("import_cv_pixel_buffer_to_wgpu: unsupported pixel format {pf:#x}");
             return None;
         }
     };
@@ -1255,7 +1253,9 @@ pub fn import_cv_pixel_buffer_to_wgpu(
         return Some(std::sync::Arc::new(texture));
     }
     #[cfg(feature = "iosurface-interop")]
-    log::debug!("import_cv_pixel_buffer_to_wgpu: IOSurface path unavailable, falling back to CPU copy");
+    log::debug!(
+        "import_cv_pixel_buffer_to_wgpu: IOSurface path unavailable, falling back to CPU copy"
+    );
 
     // CPU-copy fallback.
     log::debug!(
@@ -1281,10 +1281,11 @@ fn import_via_iosurface(
     width: u32,
     height: u32,
 ) -> Option<gpui_wgpu::wgpu::Texture> {
+    use foreign_types::ForeignType;
     use gpui_wgpu::wgpu;
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
-    use objc2_metal::MTLTexture;
+    use objc2_metal::{MTLDevice, MTLTexture};
 
     log::debug!(
         "import_via_iosurface: trying IOSurface import via device {:?}",
@@ -1321,9 +1322,7 @@ fn import_via_iosurface(
     };
 
     let raw_device = metal_hal.raw_device().clone();
-    log::debug!(
-        "import_via_iosurface: Metal device obtained, creating texture from IOSurface"
-    );
+    log::debug!("import_via_iosurface: Metal device obtained, creating texture from IOSurface");
 
     // Create a Metal texture descriptor.
     let descriptor = metal::TextureDescriptor::new();
@@ -1332,10 +1331,11 @@ fn import_via_iosurface(
     descriptor.set_width(width as u64);
     descriptor.set_height(height as u64);
     descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
-    descriptor.set_storage_mode(metal::MTLStorageMode::Managed);
+    descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
 
     // [MTLDevice newTextureWithDescriptor:iosurface:plane:].
-    let device_ptr = raw_device.lock().as_ptr();
+    let device_ptr = Retained::<ProtocolObject<dyn MTLDevice>>::as_ptr(&raw_device)
+        as *mut objc::runtime::Object;
     let descriptor_ptr = descriptor.as_ptr();
     let texture_ptr: *mut objc::runtime::Object = unsafe {
         msg_send![
@@ -1356,16 +1356,15 @@ fn import_via_iosurface(
     }
 
     // Transfer the +1 ObjC retain into an objc2 Retained.
-    let retained: Retained<ProtocolObject<dyn MTLTexture>> = unsafe {
-        Retained::from_raw(texture_ptr as *mut ProtocolObject<dyn MTLTexture>)
-    };
+    let retained: Retained<ProtocolObject<dyn MTLTexture>> =
+        unsafe { Retained::from_raw(texture_ptr as *mut ProtocolObject<dyn MTLTexture>)? };
 
     // Wrap as a wgpu-hal Metal texture (zero-copy).
     let hal_texture = unsafe {
         wgpu::hal::metal::Device::texture_from_raw(
             retained,
             wgpu_format,
-            objc2_metal::MTLTextureType::D2,
+            objc2_metal::MTLTextureType::Type2D,
             1,
             1,
             wgpu::hal::CopyExtent {
@@ -1394,7 +1393,9 @@ fn import_via_iosurface(
     };
 
     let wgpu_texture = unsafe {
-        gpu_handle.device.create_texture_from_hal::<wgpu::hal::api::Metal>(hal_texture, &texture_desc)
+        gpu_handle
+            .device
+            .create_texture_from_hal::<wgpu::hal::api::Metal>(hal_texture, &texture_desc)
     };
 
     log::info!(
@@ -1403,6 +1404,7 @@ fn import_via_iosurface(
         height
     );
 
+    println!("import via iosource");
     Some(wgpu_texture)
 }
 
@@ -1489,6 +1491,8 @@ fn import_via_cpu_copy(
     drop(data);
 
     log::debug!("import_via_cpu_copy: CPU upload complete");
+
+    println!("fallback");
 
     Some(texture)
 }

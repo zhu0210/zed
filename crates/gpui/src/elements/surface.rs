@@ -5,9 +5,9 @@ use crate::{
 };
 #[cfg(target_os = "macos")]
 use core_video::pixel_buffer::CVPixelBuffer;
+use refineable::Refineable;
 #[cfg(feature = "wgpu")]
 use std::sync::Arc;
-use refineable::Refineable;
 
 /// Source content for a [`Surface`] element.
 #[derive(Clone)]
@@ -62,9 +62,7 @@ impl From<(Arc<wgpu::Texture>, crate::GpuTextureDescriptor)> for SurfaceSource {
 
 #[cfg(feature = "wgpu")]
 impl From<(Arc<wgpu::Texture>, Option<Size<DevicePixels>>)> for SurfaceSource {
-    fn from(
-        (texture, native_size): (Arc<wgpu::Texture>, Option<Size<DevicePixels>>),
-    ) -> Self {
+    fn from((texture, native_size): (Arc<wgpu::Texture>, Option<Size<DevicePixels>>)) -> Self {
         SurfaceSource::Texture {
             texture,
             native_size,
@@ -73,13 +71,7 @@ impl From<(Arc<wgpu::Texture>, Option<Size<DevicePixels>>)> for SurfaceSource {
 }
 
 #[cfg(feature = "wgpu")]
-impl
-    From<(
-        Arc<wgpu::Texture>,
-        Arc<wgpu::Texture>,
-        Size<DevicePixels>,
-    )> for SurfaceSource
-{
+impl From<(Arc<wgpu::Texture>, Arc<wgpu::Texture>, Size<DevicePixels>)> for SurfaceSource {
     fn from(
         (y_texture, cb_cr_texture, native_size): (
             Arc<wgpu::Texture>,
@@ -267,8 +259,7 @@ impl Element for Surface {
                         cb_cr_texture,
                         native_size,
                     } => {
-                        let paint_bounds =
-                            self.object_fit.get_bounds(bounds, *native_size);
+                        let paint_bounds = self.object_fit.get_bounds(bounds, *native_size);
                         window.paint_surface_with_nv12_texture(
                             paint_bounds,
                             y_texture.clone(),

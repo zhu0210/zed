@@ -16,8 +16,10 @@ use image::RgbaImage;
 
 use core_foundation::base::TCFType;
 use core_video::{
-    metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
+    metal_texture::CVMetalTextureGetTexture,
+    metal_texture_cache::CVMetalTextureCache,
     pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    pixel_buffer::{kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange},
 };
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
@@ -1500,11 +1502,12 @@ impl MetalRenderer {
             let (image_buffer, format) = match &surface.content {
                 gpui::SurfaceContent::CvPixelBuffer(pixel_buffer) => {
                     let format = match pixel_buffer.get_pixel_format() {
-                        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-                        | kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange => {
+                        pf if pf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+                            || pf == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange =>
+                        {
                             GpuTextureFormat::Nv12
                         }
-                        kCVPixelFormatType_32BGRA => GpuTextureFormat::Bgra8Unorm,
+                        pf if pf == kCVPixelFormatType_32BGRA => GpuTextureFormat::Bgra8Unorm,
                         pf => panic!(
                             "Unsupported CVPixelBuffer pixel format in Metal renderer: {pf:#x}"
                         ),
@@ -1521,8 +1524,7 @@ impl MetalRenderer {
 
             match format {
                 GpuTextureFormat::Nv12 => {
-                    command_encoder
-                        .set_render_pipeline_state(&self.surfaces_pipeline_state);
+                    command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
                     let y_texture = self
                         .core_video_texture_cache
                         .create_texture_from_image(
@@ -1549,8 +1551,7 @@ impl MetalRenderer {
                     command_encoder.set_fragment_texture(
                         SurfaceInputIndex::YTexture as u64,
                         unsafe {
-                            let texture =
-                                CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
+                            let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
                             Some(metal::TextureRef::from_ptr(texture as *mut _))
                         },
                     );
@@ -1564,8 +1565,7 @@ impl MetalRenderer {
                     );
                 }
                 GpuTextureFormat::Bgra8Unorm => {
-                    command_encoder
-                        .set_render_pipeline_state(&self.surface_rgba_pipeline_state);
+                    command_encoder.set_render_pipeline_state(&self.surface_rgba_pipeline_state);
                     let texture = self
                         .core_video_texture_cache
                         .create_texture_from_image(
@@ -1580,8 +1580,7 @@ impl MetalRenderer {
                     command_encoder.set_fragment_texture(
                         SurfaceInputIndex::RgbaTexture as u64,
                         unsafe {
-                            let raw =
-                                CVMetalTextureGetTexture(texture.as_concrete_TypeRef());
+                            let raw = CVMetalTextureGetTexture(texture.as_concrete_TypeRef());
                             Some(metal::TextureRef::from_ptr(raw as *mut _))
                         },
                     );
