@@ -112,6 +112,8 @@ pub struct WindowsWindowState {
     /// and when a forced render was requested while another draw was in
     /// progress and had to be deferred.
     pub force_render_pending: Cell<bool>,
+    #[cfg(feature = "wgpu-renderer")]
+    pub gpu_context: GpuContext,
 
     pub click_state: ClickState,
     pub current_cursor: Cell<Option<HCURSOR>>,
@@ -234,6 +236,8 @@ impl WindowsWindowState {
             hovered: Cell::new(hovered),
             renderer: RefCell::new(renderer),
             force_render_pending: Cell::new(false),
+            #[cfg(feature = "wgpu-renderer")]
+            gpu_context,
             click_state,
             current_cursor: Cell::new(current_cursor),
             cursor_visible,
@@ -1114,6 +1118,20 @@ impl PlatformWindow for WindowsWindow {
         {
             Some(self.state.renderer.borrow().gpu_specs())
         }
+    }
+
+    #[cfg(feature = "wgpu-renderer")]
+    fn gpu_context(&self) -> Option<GpuContextHandle> {
+        let gpu_ctx = self.state.gpu_context.borrow();
+        let wgpu = gpu_ctx.as_ref()?;
+        Some(GpuContextHandle {
+            device: wgpu.device.clone(),
+            queue: wgpu.queue.clone(),
+            instance: wgpu.instance.clone(),
+            adapter: wgpu.adapter.clone(),
+            color_texture_format: wgpu.color_texture_format(),
+            supports_dual_source_blending: wgpu.supports_dual_source_blending(),
+        })
     }
 
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {

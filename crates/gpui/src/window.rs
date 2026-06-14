@@ -4,6 +4,8 @@ use crate::DebugFrameOverlayMode;
 use crate::Inspector;
 #[cfg(feature = "profiler")]
 use crate::profiler;
+#[cfg(feature = "wgpu")]
+use crate::GpuContextHandle;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
@@ -6563,6 +6565,20 @@ impl Window {
     /// Currently returns None on Mac and Windows.
     pub fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.platform_window.gpu_specs()
+    }
+
+    /// Returns a handle to the GPU resources used by this window's renderer.
+    ///
+    /// The returned [`GpuContextHandle`] provides access to the [`wgpu::Device`],
+    /// [`wgpu::Instance`], [`wgpu::Adapter`], and [`wgpu::Queue`] that GPUI
+    /// uses for rendering. Use this to create [`wgpu::Texture`]s that are
+    /// compatible with [`surface()`].
+    ///
+    /// Returns `None` when the platform uses a non-wgpu backend (DirectX, Metal)
+    /// or before GPU resources have been initialized by the first frame.
+    #[cfg(feature = "wgpu")]
+    pub fn gpu_context(&self) -> Option<GpuContextHandle> {
+        self.platform_window.gpu_context()
     }
 
     /// Perform titlebar double-click action.
