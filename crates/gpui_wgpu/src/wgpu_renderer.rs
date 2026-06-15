@@ -166,6 +166,9 @@ pub struct WgpuRenderer {
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     surface_configured: bool,
     needs_redraw: bool,
+    /// Cached uniform buffer for NV12 surface params — avoids per-frame allocation
+    /// (reused across surfaces within a single frame via ordered queue writes).
+    nv12_uniform_buffer: Option<wgpu::Buffer>,
 }
 
 impl WgpuRenderer {
@@ -473,7 +476,7 @@ impl WgpuRenderer {
         }));
 
         let resources = WgpuResources {
-            device,
+            device: device.clone(),
             queue,
             surface,
             pipelines,
@@ -490,6 +493,15 @@ impl WgpuRenderer {
             path_msaa_texture: None,
             path_msaa_view: None,
         };
+
+        // Pre-allocate the NV12 uniform buffer — reused every frame via
+        // queue.write_buffer() to avoid per-surface allocation overhead.
+        let nv12_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("surface_nv12_uniform"),
+            size: std::mem::size_of::<SurfaceParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Ok(Self {
             context: gpu_context,
@@ -514,6 +526,7 @@ impl WgpuRenderer {
             device_lost: context.device_lost_flag(),
             surface_configured: true,
             needs_redraw: false,
+            nv12_uniform_buffer: Some(nv12_uniform_buffer),
         })
     }
 
@@ -1498,16 +1511,17 @@ impl WgpuRenderer {
             scissor_rect: (u32, u32, u32, u32),
             _view: wgpu::TextureView,
         }
-        struct Nv12Draw {
-            bind_group: wgpu::BindGroup,
-            _uniform_buffer: wgpu::Buffer,
-            scissor_rect: (u32, u32, u32, u32),
-            _y_view: wgpu::TextureView,
-            _cb_cr_view: wgpu::TextureView,
-        }
 
         let mut rgba_draws: Vec<RgbaDraw> = Vec::new();
-        let mut nv12_draws: Vec<Nv12Draw> = Vec::new();
+        // NV12 data collected without per-surface buffers — the cached
+        // uniform buffer is reused via interleaved write-then-draw.
+        struct Nv12Data {
+            y_view: wgpu::TextureView,
+            cb_cr_view: wgpu::TextureView,
+            params_data: Vec<u8>,
+            scissor_rect: (u32, u32, u32, u32),
+        }
+        let mut nv12_items: Vec<Nv12Data> = Vec::new();
 
         for surface in surfaces {
             // Skip zero-sized surfaces (collapsed panels, hidden elements).
@@ -1574,7 +1588,8 @@ impl WgpuRenderer {
                         scissor_rect,
                         _view: view,
                     });
-                    *instance_offset += 1;
+                    // write_to_instance_buffer already advanced instance_offset
+                    // to the next aligned position; do not add extra offset here.
                 }
                 gpui::SurfaceContent::WgpuTextureNv12 {
                     y_texture,
@@ -1592,69 +1607,21 @@ impl WgpuRenderer {
                         )
                     };
 
-                    let uniform_buffer =
-                        resources.device.create_buffer(&wgpu::BufferDescriptor {
-                            label: Some("surface_nv12_uniform"),
-                            size: std::mem::size_of::<SurfaceParams>() as u64,
-                            usage: wgpu::BufferUsages::UNIFORM
-                                | wgpu::BufferUsages::COPY_DST,
-                            mapped_at_creation: false,
-                        });
-                    resources.queue.write_buffer(
-                        &uniform_buffer,
-                        0,
-                        params_data,
-                    );
-
                     let y_view =
                         y_texture.create_view(&wgpu::TextureViewDescriptor::default());
                     let cb_cr_view = cb_cr_texture
                         .create_view(&wgpu::TextureViewDescriptor::default());
 
-                    let bind_group = resources.device.create_bind_group(
-                        &wgpu::BindGroupDescriptor {
-                            label: Some("surface_nv12_bind_group"),
-                            layout: &resources.bind_group_layouts.surfaces,
-                            entries: &[
-                                wgpu::BindGroupEntry {
-                                    binding: 0,
-                                    resource: uniform_buffer.as_entire_binding(),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 1,
-                                    resource: wgpu::BindingResource::TextureView(
-                                        &y_view,
-                                    ),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 2,
-                                    resource: wgpu::BindingResource::TextureView(
-                                        &cb_cr_view,
-                                    ),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 3,
-                                    resource: wgpu::BindingResource::Sampler(
-                                        &resources.atlas_sampler,
-                                    ),
-                                },
-                            ],
-                        },
-                    );
-
-                    let scissor_rect = (
-                        surface.content_mask.bounds.origin.x.0.max(0.0) as u32,
-                        surface.content_mask.bounds.origin.y.0.max(0.0) as u32,
-                        surface.content_mask.bounds.size.width.0.max(0.0) as u32,
-                        surface.content_mask.bounds.size.height.0.max(0.0) as u32,
-                    );
-
-                    nv12_draws.push(Nv12Draw {
-                        bind_group,
-                        _uniform_buffer: uniform_buffer,
-                        scissor_rect,
-                        _y_view: y_view,
-                        _cb_cr_view: cb_cr_view,
+                    nv12_items.push(Nv12Data {
+                        y_view,
+                        cb_cr_view,
+                        params_data: params_data.to_vec(),
+                        scissor_rect: (
+                            surface.content_mask.bounds.origin.x.0.max(0.0) as u32,
+                            surface.content_mask.bounds.origin.y.0.max(0.0) as u32,
+                            surface.content_mask.bounds.size.width.0.max(0.0) as u32,
+                            surface.content_mask.bounds.size.height.0.max(0.0) as u32,
+                        ),
                     });
                 }
                 #[allow(unreachable_patterns)]
@@ -1679,15 +1646,55 @@ impl WgpuRenderer {
         }
 
         // Draw NV12 surfaces with the YUV→RGB conversion pipeline.
-        for draw in &nv12_draws {
+        // Each surface reuses the cached uniform buffer — we must
+        // interleave write_buffer + draw so that each draw sees the
+        // correct surface's params (queue operations are ordered).
+        let uniform_buffer = self
+            .nv12_uniform_buffer
+            .as_ref()
+            .expect("NV12 uniform buffer should be created at init");
+        for item in &nv12_items {
+            resources.queue.write_buffer(uniform_buffer, 0, &item.params_data);
+
+            let bind_group = resources.device.create_bind_group(
+                &wgpu::BindGroupDescriptor {
+                    label: Some("surface_nv12_bind_group"),
+                    layout: &resources.bind_group_layouts.surfaces,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: uniform_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(
+                                &item.y_view,
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(
+                                &item.cb_cr_view,
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Sampler(
+                                &resources.atlas_sampler,
+                            ),
+                        },
+                    ],
+                },
+            );
+
             pass.set_pipeline(&resources.pipelines.surfaces);
             pass.set_bind_group(0, &resources.globals_bind_group, &[]);
-            pass.set_bind_group(1, &draw.bind_group, &[]);
+            pass.set_bind_group(1, &bind_group, &[]);
             pass.set_scissor_rect(
-                draw.scissor_rect.0,
-                draw.scissor_rect.1,
-                draw.scissor_rect.2,
-                draw.scissor_rect.3,
+                item.scissor_rect.0,
+                item.scissor_rect.1,
+                item.scissor_rect.2,
+                item.scissor_rect.3,
             );
             pass.draw(0..4, 0..1);
         }
