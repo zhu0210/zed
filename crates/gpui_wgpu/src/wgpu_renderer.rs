@@ -166,9 +166,6 @@ pub struct WgpuRenderer {
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     surface_configured: bool,
     needs_redraw: bool,
-    /// Cached uniform buffer for NV12 surface params — avoids per-frame allocation
-    /// (reused across surfaces within a single frame via ordered queue writes).
-    nv12_uniform_buffer: Option<wgpu::Buffer>,
 }
 
 impl WgpuRenderer {
@@ -494,15 +491,6 @@ impl WgpuRenderer {
             path_msaa_view: None,
         };
 
-        // Pre-allocate the NV12 uniform buffer — reused every frame via
-        // queue.write_buffer() to avoid per-surface allocation overhead.
-        let nv12_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("surface_nv12_uniform"),
-            size: std::mem::size_of::<SurfaceParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         Ok(Self {
             context: gpu_context,
             compositor_gpu,
@@ -526,7 +514,6 @@ impl WgpuRenderer {
             device_lost: context.device_lost_flag(),
             surface_configured: true,
             needs_redraw: false,
-            nv12_uniform_buffer: Some(nv12_uniform_buffer),
         })
     }
 
@@ -1646,15 +1633,26 @@ impl WgpuRenderer {
         }
 
         // Draw NV12 surfaces with the YUV→RGB conversion pipeline.
-        // Each surface reuses the cached uniform buffer — we must
-        // interleave write_buffer + draw so that each draw sees the
-        // correct surface's params (queue operations are ordered).
-        let uniform_buffer = self
-            .nv12_uniform_buffer
-            .as_ref()
-            .expect("NV12 uniform buffer should be created at init");
-        for item in &nv12_items {
-            resources.queue.write_buffer(uniform_buffer, 0, &item.params_data);
+        // Each surface uses its own uniform buffer (created here,
+        // not cached) so bind-group lifetimes are correct and
+        // buffer offsets are naturally aligned.
+        struct Nv12Draw {
+            bind_group: wgpu::BindGroup,
+            _uniform_buffer: wgpu::Buffer,
+            scissor_rect: (u32, u32, u32, u32),
+        }
+        let mut nv12_draws: Vec<Nv12Draw> = Vec::with_capacity(nv12_items.len());
+
+        for item in nv12_items {
+            let uniform_buffer = resources.device.create_buffer(
+                &wgpu::BufferDescriptor {
+                    label: Some("surface_nv12_uniform"),
+                    size: std::mem::size_of::<SurfaceParams>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                },
+            );
+            resources.queue.write_buffer(&uniform_buffer, 0, &item.params_data);
 
             let bind_group = resources.device.create_bind_group(
                 &wgpu::BindGroupDescriptor {
@@ -1687,14 +1685,22 @@ impl WgpuRenderer {
                 },
             );
 
+            nv12_draws.push(Nv12Draw {
+                bind_group,
+                _uniform_buffer: uniform_buffer,
+                scissor_rect: item.scissor_rect,
+            });
+        }
+
+        for draw in &nv12_draws {
             pass.set_pipeline(&resources.pipelines.surfaces);
             pass.set_bind_group(0, &resources.globals_bind_group, &[]);
-            pass.set_bind_group(1, &bind_group, &[]);
+            pass.set_bind_group(1, &draw.bind_group, &[]);
             pass.set_scissor_rect(
-                item.scissor_rect.0,
-                item.scissor_rect.1,
-                item.scissor_rect.2,
-                item.scissor_rect.3,
+                draw.scissor_rect.0,
+                draw.scissor_rect.1,
+                draw.scissor_rect.2,
+                draw.scissor_rect.3,
             );
             pass.draw(0..4, 0..1);
         }
