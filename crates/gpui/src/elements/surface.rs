@@ -154,15 +154,19 @@ impl Element for Surface {
         let mut style = Style::default();
         style.refine(&self.style);
 
-        // Communicate the texture's native aspect ratio to the layout
-        // engine. This allows the surface to size proportionally in flex
-        // containers, matching the behavior of `img()`.
-        match &self.source {
+        // Make the surface fill its parent so ObjectFit::Contain has a
+        // non-zero layout bound to work with.  Without explicit size,
+        // GPUI's layout assigns zero bounds to auto-sized children in
+        // flex containers — see issue #1.
+        let has_native_size = match &self.source {
             #[cfg(target_os = "macos")]
             SurfaceSource::Surface(pixel_buffer) => {
                 let h = pixel_buffer.get_height();
                 if h > 0 {
                     style.aspect_ratio = Some(pixel_buffer.get_width() as f32 / h as f32);
+                    true
+                } else {
+                    false
                 }
             }
             #[cfg(feature = "wgpu")]
@@ -172,6 +176,9 @@ impl Element for Surface {
             } => {
                 if size.height.0 > 0 {
                     style.aspect_ratio = Some(size.width.0 as f32 / size.height.0 as f32);
+                    true
+                } else {
+                    false
                 }
             }
             #[cfg(feature = "wgpu")]
@@ -179,9 +186,17 @@ impl Element for Surface {
                 if native_size.height.0 > 0 {
                     style.aspect_ratio =
                         Some(native_size.width.0 as f32 / native_size.height.0 as f32);
+                    true
+                } else {
+                    false
                 }
             }
-            _ => {}
+            _ => false,
+        };
+
+        if has_native_size {
+            style.size.width = crate::relative(1.0).into();
+            style.size.height = crate::relative(1.0).into();
         }
 
         let layout_id = window.request_layout(style, [], cx);
@@ -244,6 +259,12 @@ impl Element for Surface {
                         native_size: Some(size),
                     } => {
                         let paint_bounds = self.object_fit.get_bounds(bounds, *size);
+                        eprintln!(
+                            "RGBA paint: layout_bounds={:?}×{:?}, native={:?}×{:?}, paint_bounds={:?}×{:?}",
+                            bounds.origin, bounds.size,
+                            size.width, size.height,
+                            paint_bounds.origin, paint_bounds.size,
+                        );
                         window.paint_surface_with_texture(paint_bounds, texture.clone());
                     }
                     #[cfg(feature = "wgpu")]
@@ -260,6 +281,12 @@ impl Element for Surface {
                         native_size,
                     } => {
                         let paint_bounds = self.object_fit.get_bounds(bounds, *native_size);
+                        eprintln!(
+                            "NV12 paint: layout_bounds={:?}×{:?}, native={:?}×{:?}, paint_bounds={:?}×{:?}",
+                            bounds.origin, bounds.size,
+                            native_size.width, native_size.height,
+                            paint_bounds.origin, paint_bounds.size,
+                        );
                         window.paint_surface_with_nv12_texture(
                             paint_bounds,
                             y_texture.clone(),
