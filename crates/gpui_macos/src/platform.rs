@@ -1504,7 +1504,6 @@ fn import_via_iosurface(
         height
     );
 
-    println!("import via iosource");
     Some(wgpu_texture)
 }
 
