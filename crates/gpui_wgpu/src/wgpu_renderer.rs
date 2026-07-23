@@ -4895,10 +4895,38 @@ mod normalized_surface_tests {
     fn assert_rgb_close(actual: [f32; 3], expected: [f32; 3]) {
         for (actual, expected) in actual.into_iter().zip(expected) {
             assert!(
-                (actual - expected).abs() < 0.02,
+                (actual - expected).abs() < 0.002,
                 "expected {expected}, got {actual}"
             );
         }
+    }
+
+    fn reference_ycbcr_to_rgb(
+        matrix: gpui::VideoColorMatrix,
+        range: gpui::VideoColorRange,
+        y: f32,
+        cb: f32,
+        cr: f32,
+    ) -> [f32; 3] {
+        let (kr, kb) = match matrix {
+            gpui::VideoColorMatrix::Bt601 => (0.299, 0.114),
+            gpui::VideoColorMatrix::Bt709 => (0.2126, 0.0722),
+            gpui::VideoColorMatrix::Bt2020 => (0.2627, 0.0593),
+        };
+        let kg = 1.0 - kr - kb;
+        let (y, cb, cr) = match range {
+            gpui::VideoColorRange::Full => (y, cb - 0.5, cr - 0.5),
+            gpui::VideoColorRange::Limited => (
+                (y - 16.0 / 255.0) * 255.0 / 219.0,
+                (cb - 0.5) * 255.0 / 224.0,
+                (cr - 0.5) * 255.0 / 224.0,
+            ),
+        };
+        let r_cr = 2.0 * (1.0 - kr);
+        let b_cb = 2.0 * (1.0 - kb);
+        let g_cb = -kb * b_cb / kg;
+        let g_cr = -kr * r_cr / kg;
+        [y + r_cr * cr, y + g_cb * cb + g_cr * cr, y + b_cb * cb]
     }
 
     fn scaled_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
@@ -4971,6 +4999,38 @@ mod normalized_surface_tests {
             apply_color_matrix(conversion, 81.0 / 255.0, 90.0 / 255.0, 240.0 / 255.0),
             [1.0, 0.0, 0.0],
         );
+    }
+
+    #[test]
+    fn all_color_matrices_and_ranges_match_reference_equations() {
+        for matrix in [
+            gpui::VideoColorMatrix::Bt601,
+            gpui::VideoColorMatrix::Bt709,
+            gpui::VideoColorMatrix::Bt2020,
+        ] {
+            for range in [gpui::VideoColorRange::Full, gpui::VideoColorRange::Limited] {
+                let conversion = ycbcr_to_rgb_matrix(matrix, range);
+                for [y, cb, cr] in [[0.25, 0.35, 0.75], [0.50, 0.50, 0.50], [0.80, 0.65, 0.30]] {
+                    assert_rgb_close(
+                        apply_color_matrix(conversion, y, cb, cr),
+                        reference_ycbcr_to_rgb(matrix, range, y, cb, cr),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_range_color_matrices_map_reference_black_and_white() {
+        for matrix in [
+            gpui::VideoColorMatrix::Bt601,
+            gpui::VideoColorMatrix::Bt709,
+            gpui::VideoColorMatrix::Bt2020,
+        ] {
+            let conversion = ycbcr_to_rgb_matrix(matrix, gpui::VideoColorRange::Full);
+            assert_rgb_close(apply_color_matrix(conversion, 0.0, 0.5, 0.5), [0.0; 3]);
+            assert_rgb_close(apply_color_matrix(conversion, 1.0, 0.5, 0.5), [1.0; 3]);
+        }
     }
 }
 
