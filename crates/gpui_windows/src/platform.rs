@@ -1035,22 +1035,16 @@ impl Platform for WindowsPlatform {
     }
 
     #[cfg(feature = "wgpu-renderer")]
-    fn gpu_context(&self) -> Option<GpuContextHandle> {
-        let wgpu = self.inner.state.gpu_context.borrow();
+    fn gpu_context(&self) -> Option<gpui::WgpuContextHandle> {
+        let gpu_ctx = self.inner.state.gpu_context.borrow();
+        let wgpu = gpu_ctx.as_ref()?.borrow();
         let wgpu_ctx = wgpu.as_ref()?;
 
-        Some(GpuContextHandle {
-            device: wgpu_ctx.device.clone(),
-            queue: wgpu_ctx.queue.clone(),
-            instance: wgpu_ctx.instance.clone(),
-            adapter: wgpu_ctx.adapter.clone(),
-            color_texture_format: wgpu_ctx.color_texture_format(),
-            supports_dual_source_blending: wgpu_ctx.supports_dual_source_blending(),
-        })
+        wgpu_ctx.handle().ok()
     }
 
     #[cfg(feature = "wgpu-renderer")]
-    fn set_gpu_context(&self, handle: GpuContextHandle) -> anyhow::Result<()> {
+    fn set_gpu_context(&self, descriptor: gpui::WgpuContextDescriptor) -> anyhow::Result<()> {
         let gpu_ctx = self.inner.state.gpu_context.borrow();
         if gpu_ctx.is_some() {
             anyhow::bail!(
@@ -1058,7 +1052,9 @@ impl Platform for WindowsPlatform {
             );
         }
         drop(gpu_ctx);
-        *self.inner.state.gpu_context.borrow_mut() = Some(WgpuContext::from_handle(handle));
+        *self.inner.state.gpu_context.borrow_mut() = Some(Rc::new(RefCell::new(Some(
+            WgpuContext::from_descriptor(descriptor),
+        ))));
         Ok(())
     }
 }

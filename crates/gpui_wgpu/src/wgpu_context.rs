@@ -6,13 +6,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use wgpu::TextureFormat;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::ffi::CStr;
 
 #[cfg(target_os = "linux")]
 pub(crate) const EXTERNAL_SEMAPHORE_FD_EXTENSION: &CStr = c"VK_KHR_external_semaphore_fd";
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) const QUEUE_FAMILY_FOREIGN_EXTENSION: &CStr = c"VK_EXT_queue_family_foreign";
 
 pub struct WgpuContext {
@@ -24,6 +24,8 @@ pub struct WgpuContext {
     dual_source_blending: bool,
     color_texture_format: wgpu::TextureFormat,
     device_lost: Arc<AtomicBool>,
+    #[cfg(target_os = "linux")]
+    drm_render_node: std::sync::OnceLock<Option<std::path::PathBuf>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,6 +67,32 @@ impl raw_window_handle::HasDisplayHandle for WebDisplaySource {
     }
 }
 
+#[derive(Clone, Debug)]
+pub enum WgpuContextCompatibilityError {
+    UnsupportedSurface {
+        adapter_name: String,
+        backend: wgpu::Backend,
+        device_id: u32,
+    },
+}
+
+impl std::fmt::Display for WgpuContextCompatibilityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedSurface {
+                adapter_name,
+                backend,
+                device_id,
+            } => write!(
+                formatter,
+                "adapter {adapter_name:?} (backend={backend:?}, device={device_id:#06x}) is not compatible with the window surface"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WgpuContextCompatibilityError {}
+
 #[derive(Clone, Copy)]
 pub struct CompositorGpuHint {
     pub vendor_id: u32,
@@ -72,6 +100,22 @@ pub struct CompositorGpuHint {
 }
 
 impl WgpuContext {
+    pub fn handle(&self) -> anyhow::Result<gpui::WgpuContextHandle> {
+        let handle = gpui::WgpuContextHandle::from_descriptor(gpui::WgpuContextDescriptor::new(
+            self.instance.clone(),
+            self.adapter.clone(),
+            self.device.clone(),
+            self.queue.clone(),
+        ))?;
+        #[cfg(target_os = "linux")]
+        let handle = handle.with_drm_render_node(
+            self.drm_render_node
+                .get_or_init(|| adapter_drm_render_node(&self.adapter))
+                .clone(),
+        );
+        Ok(handle)
+    }
+
     #[cfg(not(target_family = "wasm"))]
     pub fn new(
         instance: wgpu::Instance,
@@ -147,6 +191,8 @@ impl WgpuContext {
             dual_source_blending,
             color_texture_format,
             device_lost,
+            #[cfg(target_os = "linux")]
+            drm_render_node: std::sync::OnceLock::new(),
         })
     }
 
@@ -239,6 +285,8 @@ impl WgpuContext {
             dual_source_blending,
             color_texture_format,
             device_lost,
+            #[cfg(target_os = "linux")]
+            drm_render_node: std::sync::OnceLock::new(),
         };
         Ok(PreparedWebGraphics { context, surface })
     }
@@ -283,11 +331,7 @@ impl WgpuContext {
             .using_resolution(adapter.limits())
             .using_alignment(adapter.limits());
 
-        let required_limits = wgpu::Limits::downlevel_defaults()
-            .using_resolution(adapter.limits())
-            .using_alignment(adapter.limits());
-
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         if adapter.get_info().backend == wgpu::Backend::Vulkan {
             match Self::create_vulkan_device_with_external_sync(
                 adapter,
@@ -304,9 +348,7 @@ impl WgpuContext {
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    log::warn!(
-                        "Could not enable Vulkan external semaphore synchronization: {error:#}"
-                    );
+                    log::warn!("Could not enable Vulkan external frame import: {error:#}");
                 }
             }
         }
@@ -331,7 +373,7 @@ impl WgpuContext {
         ))
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) fn create_vulkan_device_with_external_sync(
         adapter: &wgpu::Adapter,
         required_features: wgpu::Features,
@@ -342,6 +384,7 @@ impl WgpuContext {
             return Ok(None);
         };
 
+        #[cfg(target_os = "linux")]
         if !hal_adapter
             .physical_device_capabilities()
             .supports_extension(EXTERNAL_SEMAPHORE_FD_EXTENSION)
@@ -353,12 +396,62 @@ impl WgpuContext {
             .physical_device_capabilities()
             .supports_extension(QUEUE_FAMILY_FOREIGN_EXTENSION);
 
+        #[cfg(target_os = "android")]
+        {
+            use ash::vk;
+            let capabilities = hal_adapter.physical_device_capabilities();
+            if !supports_foreign
+                || !capabilities
+                    .supports_extension(ash::android::external_memory_android_hardware_buffer::NAME)
+                || capabilities.properties().api_version < vk::API_VERSION_1_1
+            {
+                return Ok(None);
+            }
+            let mut ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default();
+            let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut ycbcr);
+            // SAFETY: this Vulkan 1.1 adapter owns the physical device, and the
+            // feature output chain contains live, exclusively borrowed storage.
+            unsafe {
+                hal_adapter
+                    .shared_instance()
+                    .raw_instance()
+                    .get_physical_device_features2(
+                        hal_adapter.raw_physical_device(),
+                        &mut features,
+                    );
+            }
+            if ycbcr.sampler_ycbcr_conversion != vk::TRUE {
+                return Ok(None);
+            }
+        }
+        #[cfg(target_os = "android")]
+        let ycbcr_enabled = std::cell::Cell::new(false);
+        #[cfg(target_os = "android")]
+        let enabled = &ycbcr_enabled;
         let callback: Box<wgpu::hal::vulkan::CreateDeviceCallback<'_>> = Box::new(move |args| {
+            #[cfg(target_os = "linux")]
             if !args.extensions.contains(&EXTERNAL_SEMAPHORE_FD_EXTENSION) {
                 args.extensions.push(EXTERNAL_SEMAPHORE_FD_EXTENSION);
             }
             if supports_foreign && !args.extensions.contains(&QUEUE_FAMILY_FOREIGN_EXTENSION) {
                 args.extensions.push(QUEUE_FAMILY_FOREIGN_EXTENSION);
+            }
+            #[cfg(target_os = "android")]
+            {
+                let extension = ash::android::external_memory_android_hardware_buffer::NAME;
+                if !args.extensions.contains(&extension) {
+                    args.extensions.push(extension);
+                }
+                // HAL exposes features through its normal Vulkan create chain.
+                // Enable the advertised bit and detach the temporary chain so
+                // HAL can build its final chain without linking nodes twice.
+                let info = args
+                    .device_features
+                    .add_to_device_create(ash::vk::DeviceCreateInfo::default());
+                // SAFETY: these nodes originate from the exclusive mutable
+                // device_features borrow. The callback is synchronous; no
+                // consumer holds references to the temporary chain.
+                enabled.set(unsafe { enable_android_ycbcr_and_detach(info.p_next) });
             }
         });
 
@@ -374,6 +467,12 @@ impl WgpuContext {
                 )
                 .map_err(|error| anyhow::anyhow!("opening Vulkan HAL device: {error:?}"))?
         };
+
+        #[cfg(target_os = "android")]
+        anyhow::ensure!(
+            ycbcr_enabled.get(),
+            "HAL did not expose samplerYcbcrConversion features"
+        );
 
         let descriptor = wgpu::DeviceDescriptor {
             label: Some("gpui_device"),
@@ -403,17 +502,18 @@ impl WgpuContext {
         })
     }
 
-    pub fn check_compatible_with_surface(&self, surface: &wgpu::Surface<'_>) -> anyhow::Result<()> {
+    pub fn check_compatible_with_surface(
+        &self,
+        surface: &wgpu::Surface<'_>,
+    ) -> Result<(), WgpuContextCompatibilityError> {
         let caps = surface.get_capabilities(&self.adapter);
         if caps.formats.is_empty() {
             let info = self.adapter.get_info();
-            anyhow::bail!(
-                "Adapter {:?} (backend={:?}, device={:#06x}) is not compatible with the \
-                 display surface for this window.",
-                info.name,
-                info.backend,
-                info.device,
-            );
+            return Err(WgpuContextCompatibilityError::UnsupportedSurface {
+                adapter_name: info.name,
+                backend: info.backend,
+                device_id: info.device,
+            });
         }
         Ok(())
     }
@@ -674,7 +774,7 @@ impl WgpuContext {
     /// Create a `WgpuContext` from a pre-existing wgpu device.
     ///
     /// Used when embedding GPUI in an application that already owns a
-    /// wgpu device — the caller constructs a [`gpui::GpuContextHandle`]
+    /// wgpu device — the caller constructs a [`gpui::WgpuContextDescriptor`]
     /// with their device/instance/adapter/queue and passes it to
     /// [`Platform::set_gpu_context()`], which calls this constructor.
     ///
@@ -682,9 +782,10 @@ impl WgpuContext {
     /// compatible with the window surfaces GPUI will create.
     /// Compatibility is verified per-window in `WgpuRenderer::new()`
     /// via [`WgpuContext::check_compatible_with_surface`].
-    pub fn from_handle(handle: gpui::GpuContextHandle) -> Self {
+    pub fn from_descriptor(descriptor: gpui::WgpuContextDescriptor) -> Self {
+        let (instance, adapter, device, queue) = descriptor.into_parts();
         let device_lost = Arc::new(AtomicBool::new(false));
-        handle.device.set_device_lost_callback({
+        device.set_device_lost_callback({
             let device_lost = Arc::clone(&device_lost);
             move |reason, message| {
                 log::error!("wgpu device lost: reason={reason:?}, message={message}");
@@ -693,15 +794,77 @@ impl WgpuContext {
                 }
             }
         });
+        let dual_source_blending = adapter
+            .features()
+            .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
+        let color_texture_format = preferred_color_texture_format(&adapter);
+        let backend = match adapter.get_info().backend {
+            wgpu::Backend::BrowserWebGpu => WgpuBackend::BrowserWebGpu,
+            wgpu::Backend::Gl => WgpuBackend::Gl,
+            backend => WgpuBackend::Native(backend),
+        };
         Self {
-            instance: handle.instance,
-            adapter: handle.adapter,
-            device: handle.device,
-            queue: handle.queue,
-            dual_source_blending: handle.supports_dual_source_blending,
-            color_texture_format: handle.color_texture_format,
+            backend,
+            instance,
+            adapter,
+            device,
+            queue,
+            dual_source_blending,
+            color_texture_format,
             device_lost,
+            #[cfg(target_os = "linux")]
+            drm_render_node: std::sync::OnceLock::new(),
         }
+    }
+}
+
+/// Query the selected physical device itself. PCI IDs are deliberately not a
+/// fallback: two identical GPUs have the same IDs but different DRM nodes.
+#[cfg(target_os = "linux")]
+fn adapter_drm_render_node(adapter: &wgpu::Adapter) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    // SAFETY: the adapter owns this HAL adapter and keeps its VkInstance live.
+    let hal = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }?;
+    let instance = hal.shared_instance().raw_instance();
+    let physical = hal.raw_physical_device();
+    // SAFETY: physical is a live physical device belonging to instance.
+    let extensions = unsafe { instance.enumerate_device_extension_properties(physical) }.ok()?;
+    let supported = extensions.iter().any(|extension| {
+        // SAFETY: Vulkan extension_name is a null-terminated string in the fixed array.
+        (unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) })
+            == ash::ext::physical_device_drm::NAME
+    });
+    if !supported {
+        return None;
+    }
+    let mut drm = ash::vk::PhysicalDeviceDrmPropertiesEXT::default();
+    let mut properties = ash::vk::PhysicalDeviceProperties2::default().push_next(&mut drm);
+    // SAFETY: the live adapter uses Vulkan 1.1+, and the supported extension's
+    // output structure is correctly chained and remains alive during the query.
+    unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
+    if drm.has_render != ash::vk::TRUE {
+        return None;
+    }
+    let major = u32::try_from(drm.render_major).ok()?;
+    let minor = u32::try_from(drm.render_minor).ok()?;
+    let path = std::path::PathBuf::from(format!("/dev/dri/renderD{minor}"));
+    let metadata = std::fs::metadata(&path).ok()?;
+    (metadata.file_type().is_char_device()
+        && libc::major(metadata.rdev()) == major
+        && libc::minor(metadata.rdev()) == minor)
+        .then_some(path)
+}
+
+fn preferred_color_texture_format(adapter: &wgpu::Adapter) -> wgpu::TextureFormat {
+    let required = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
+    if adapter
+        .get_texture_format_features(wgpu::TextureFormat::Bgra8Unorm)
+        .allowed_usages
+        .contains(required)
+    {
+        wgpu::TextureFormat::Bgra8Unorm
+    } else {
+        wgpu::TextureFormat::Rgba8Unorm
     }
 }
 
@@ -742,5 +905,49 @@ mod tests {
             parse_pci_id(&format!("{:#x}", 0x1234)).unwrap(),
             parse_pci_id(&format!("{:#X}", 0x1234)).unwrap(),
         );
+    }
+}
+
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+unsafe fn enable_android_ycbcr_and_detach(chain: *const std::ffi::c_void) -> bool {
+    use ash::vk;
+    let mut node = chain as *mut vk::BaseOutStructure<'_>;
+    let mut enabled = false;
+    // SAFETY: caller exclusively owns this finite mutable Vulkan feature chain.
+    // Detach every node after saving its successor, preserving all feature values
+    // except the supported samplerYcbcrConversion bit that this helper enables.
+    unsafe {
+        while let Some(header) = node.as_mut() {
+            let next = header.p_next;
+            if header.s_type == vk::StructureType::PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES
+            {
+                (*node.cast::<vk::PhysicalDeviceSamplerYcbcrConversionFeatures<'_>>())
+                    .sampler_ycbcr_conversion = vk::TRUE;
+                enabled = true;
+            }
+            header.p_next = std::ptr::null_mut();
+            node = next;
+        }
+    }
+    enabled
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod android_feature_tests {
+    #[test]
+    fn enables_ycbcr_without_corrupting_other_features_or_relinking_nodes() {
+        use ash::vk;
+        let mut ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default();
+        let mut timeline =
+            vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
+        let info = vk::DeviceCreateInfo::default()
+            .push_next(&mut ycbcr)
+            .push_next(&mut timeline);
+        // SAFETY: both nodes are exclusively owned by this test until the call returns.
+        assert!(unsafe { super::enable_android_ycbcr_and_detach(info.p_next) });
+        assert_eq!(ycbcr.sampler_ycbcr_conversion, vk::TRUE);
+        assert_eq!(timeline.timeline_semaphore, vk::TRUE);
+        assert!(ycbcr.p_next.is_null());
+        assert!(timeline.p_next.is_null());
     }
 }

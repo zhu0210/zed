@@ -97,7 +97,7 @@ use crate::linux::{
 };
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, CursorStyle, DevicePixels, DisplayId, ExternalDragPayload,
-    FileDragPaths, FileDropEvent, ForegroundExecutor, GpuContextHandle, KeyDownEvent, KeyUpEvent, Keystroke,
+    FileDragPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, KeyUpEvent, Keystroke,
     Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
     MouseUpEvent, NavigationDirection, Pixels, PlatformDisplay, PlatformInput,
     PlatformKeyboardLayout, PlatformWindow, Point, ScrollDelta, ScrollWheelEvent, SharedString,
@@ -1294,21 +1294,14 @@ impl LinuxClient for WaylandClient {
         inner(active_window.map(|aw| aw.surface()))
     }
 
-    fn gpu_context(&self) -> Option<GpuContextHandle> {
+    fn gpu_context(&self) -> Option<gpui::WgpuContextHandle> {
         let state = self.0.borrow();
         let wgpu = state.gpu_context.borrow();
         let wgpu = wgpu.as_ref()?;
-        Some(GpuContextHandle {
-            device: wgpu.device.clone(),
-            queue: wgpu.queue.clone(),
-            instance: wgpu.instance.clone(),
-            adapter: wgpu.adapter.clone(),
-            color_texture_format: wgpu.color_texture_format(),
-            supports_dual_source_blending: wgpu.supports_dual_source_blending(),
-        })
+        wgpu.handle().ok()
     }
 
-    fn set_gpu_context(&self, handle: GpuContextHandle) -> anyhow::Result<()> {
+    fn set_gpu_context(&self, descriptor: gpui::WgpuContextDescriptor) -> anyhow::Result<()> {
         let state = self.0.borrow();
         if state.gpu_context.borrow().is_some() {
             anyhow::bail!(
@@ -1316,7 +1309,7 @@ impl LinuxClient for WaylandClient {
             );
         }
         drop(state);
-        *self.0.borrow().gpu_context.borrow_mut() = Some(WgpuContext::from_handle(handle));
+        *self.0.borrow().gpu_context.borrow_mut() = Some(WgpuContext::from_descriptor(descriptor));
         Ok(())
     }
 }

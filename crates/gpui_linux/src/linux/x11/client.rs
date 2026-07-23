@@ -60,10 +60,10 @@ use crate::linux::{
 use crate::linux::{LinuxCommon, LinuxKeyboardLayout, X11Window, modifiers_from_xinput_info};
 
 use gpui::{
-    AnyWindowHandle, Bounds, ClipboardItem, CursorStyle, DisplayId, FileDropEvent, GpuContextHandle,
-    Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, Pixels, PlatformDisplay,
-    PlatformInput, PlatformKeyboardLayout, PlatformWindow, Point, RequestFrameOptions, ScrollDelta,
-    Size, TouchPhase, WindowButtonLayout, WindowParams, point, px,
+    AnyWindowHandle, Bounds, ClipboardItem, CursorStyle, DisplayId, FileDropEvent, Keystroke,
+    Modifiers, ModifiersChangedEvent, MouseButton, Pixels, PlatformDisplay, PlatformInput,
+    PlatformKeyboardLayout, PlatformWindow, Point, RequestFrameOptions, ScrollDelta, Size,
+    TouchPhase, WindowButtonLayout, WindowParams, point, px,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext, WgpuContext};
 
@@ -1873,21 +1873,14 @@ impl LinuxClient for X11Client {
             .unwrap_or(std::future::ready(None))
     }
 
-    fn gpu_context(&self) -> Option<GpuContextHandle> {
+    fn gpu_context(&self) -> Option<gpui::WgpuContextHandle> {
         let state = self.0.borrow();
         let wgpu = state.gpu_context.borrow();
         let wgpu = wgpu.as_ref()?;
-        Some(GpuContextHandle {
-            device: wgpu.device.clone(),
-            queue: wgpu.queue.clone(),
-            instance: wgpu.instance.clone(),
-            adapter: wgpu.adapter.clone(),
-            color_texture_format: wgpu.color_texture_format(),
-            supports_dual_source_blending: wgpu.supports_dual_source_blending(),
-        })
+        wgpu.handle().ok()
     }
 
-    fn set_gpu_context(&self, handle: GpuContextHandle) -> anyhow::Result<()> {
+    fn set_gpu_context(&self, descriptor: gpui::WgpuContextDescriptor) -> anyhow::Result<()> {
         let state = self.0.borrow();
         if state.gpu_context.borrow().is_some() {
             anyhow::bail!(
@@ -1895,7 +1888,7 @@ impl LinuxClient for X11Client {
             );
         }
         drop(state);
-        *self.0.borrow().gpu_context.borrow_mut() = Some(WgpuContext::from_handle(handle));
+        *self.0.borrow().gpu_context.borrow_mut() = Some(WgpuContext::from_descriptor(descriptor));
         Ok(())
     }
 }

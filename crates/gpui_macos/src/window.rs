@@ -1065,13 +1065,8 @@ impl MacWindow {
                 #[cfg(feature = "wgpu-renderer")]
                 renderer_context: renderer_context.clone(),
                 #[cfg(feature = "wgpu-renderer")]
-                renderer: renderer::Renderer::new(
-                    renderer_context,
-                    &raw_window,
-                    wgpu_config,
-                    None,
-                )
-                .unwrap(),
+                renderer: renderer::Renderer::new(renderer_context, &raw_window, wgpu_config, None)
+                    .unwrap(),
                 request_frame_callback: None,
                 event_callback: None,
                 activate_callback: None,
@@ -1964,18 +1959,11 @@ impl PlatformWindow for MacWindow {
     }
 
     #[cfg(feature = "wgpu-renderer")]
-    fn gpu_context(&self) -> Option<gpui::GpuContextHandle> {
+    fn gpu_context(&self) -> Option<gpui::WgpuContextHandle> {
         let lock = self.0.lock();
         let gpu_ctx = lock.renderer_context.borrow();
         let wgpu = gpu_ctx.as_ref()?;
-        Some(gpui::GpuContextHandle {
-            device: wgpu.device.clone(),
-            queue: wgpu.queue.clone(),
-            instance: wgpu.instance.clone(),
-            adapter: wgpu.adapter.clone(),
-            color_texture_format: wgpu.color_texture_format(),
-            supports_dual_source_blending: wgpu.supports_dual_source_blending(),
-        })
+        wgpu.handle().ok()
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {

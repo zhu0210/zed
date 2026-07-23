@@ -1,11 +1,16 @@
 // todo("windows"): remove
 #![cfg_attr(windows, allow(dead_code))]
 
+#[cfg(feature = "wgpu")]
+use crate::DevicePixels;
+
+#[cfg(feature = "wgpu")]
+use std::sync::Arc;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla,
     Pixels, Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
@@ -13,7 +18,6 @@ use std::{
     iter::Peekable,
     ops::{Add, Range, Sub},
     slice,
-    sync::Arc,
 };
 
 #[allow(non_camel_case_types, unused)]
@@ -771,17 +775,17 @@ pub enum SurfaceContent {
     /// macOS direct CVPixelBuffer (no pre-registration needed).
     #[cfg(target_os = "macos")]
     CvPixelBuffer(core_video::pixel_buffer::CVPixelBuffer),
-    /// Cross-platform wgpu texture. The [`Arc`] owns the GPU resource —
-    /// no separate unregistration step is needed.
+    /// Validated RGBA/BGRA texture and its color metadata.
     #[cfg(feature = "wgpu")]
-    WgpuTexture(Arc<wgpu::Texture>),
-    /// Cross-platform NV12 wgpu texture (two-plane YUV 4:2:0). The Y plane
-    /// is R8Unorm, the CbCr plane is Rg8Unorm. The [`Arc`]s own the GPU
-    /// resources — no separate unregistration step is needed.
+    WgpuRgba(crate::RgbaTextureSource),
+    /// Validated NV12 textures and their color-conversion metadata.
     #[cfg(feature = "wgpu")]
     WgpuTextureNv12 {
+        /// Luma plane.
         y_texture: Arc<wgpu::Texture>,
+        /// Interleaved chroma plane.
         cb_cr_texture: Arc<wgpu::Texture>,
+        /// Source dimensions for object-fit.
         native_size: Size<DevicePixels>,
     },
     /// Cross-platform NV12 wgpu texture with an explicit color transform.
@@ -801,17 +805,23 @@ pub enum SurfaceContent {
         native_size: Size<DevicePixels>,
         color_transform: crate::Nv12ColorTransform,
     },
+    /// Validated NV12 planes with explicit color metadata.
+    #[cfg(feature = "wgpu")]
+    WgpuNv12(crate::Nv12TextureSource),
 }
 
 /// A GPU texture composited into the scene.
 ///
-/// Carries either a CVPixelBuffer (macOS direct path) or an Arc<wgpu::Texture>
-/// (cross-platform).
+/// Retains the backing native or wgpu resource for the scene frame.
 #[derive(Clone, Debug)]
 pub struct PaintSurface {
+    /// Scene draw order.
     pub order: DrawOrder,
+    /// Destination bounds.
     pub bounds: Bounds<ScaledPixels>,
+    /// Active clip mask.
     pub content_mask: ContentMask<ScaledPixels>,
+    /// Texture or native frame content.
     pub content: SurfaceContent,
 }
 

@@ -1,11 +1,15 @@
 #[cfg(feature = "profiler")]
 use crate::DebugFrameOverlayMode;
-#[cfg(feature = "profiler")]
-use crate::profiler;
-#[cfg(all(target_os = "linux", feature = "wgpu"))]
+#[cfg(feature = "wgpu")]
+use crate::ExternalFrameOutcome;
+#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "wgpu"))]
 use crate::ExternalFrameRequest;
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
+#[cfg(feature = "wgpu")]
+use crate::WgpuContextHandle;
+#[cfg(feature = "profiler")]
+use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
@@ -26,8 +30,6 @@ use crate::{
     WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
     point, prelude::*, px, rems, size, transparent_black,
 };
-#[cfg(feature = "wgpu")]
-use crate::{ExternalFrameOutcome, GpuContextHandle};
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
 use crate::interactive::TouchEvent;
@@ -4795,18 +4797,12 @@ impl Window {
         });
     }
 
-    /// Paint a wgpu texture into the scene (cross-platform).
-    ///
-    /// The texture is sampled directly by the renderer. The [`Arc`] reference
-    /// is held by the scene for one frame — no registration or unregistration
-    /// is needed.
-    ///
-    /// This is a low-level API. Most callers should use the [`surface()`] element.
+    /// Paint a validated RGBA/BGRA texture source into the scene.
     #[cfg(feature = "wgpu")]
-    pub fn paint_surface_with_texture(
+    pub fn paint_surface_with_rgba_source(
         &mut self,
         bounds: Bounds<Pixels>,
-        texture: Arc<wgpu::Texture>,
+        source: crate::RgbaTextureSource,
     ) {
         use crate::{PaintSurface, SurfaceContent};
 
@@ -4817,23 +4813,16 @@ impl Window {
             order: 0,
             bounds,
             content_mask,
-            content: SurfaceContent::WgpuTexture(texture),
+            content: SurfaceContent::WgpuRgba(source),
         });
     }
 
-    /// Paint an NV12 (YUV 4:2:0) wgpu texture into the scene (cross-platform).
-    ///
-    /// Takes two textures — the Y plane (R8Unorm) and the CbCr plane (Rg8Unorm).
-    /// The renderer applies YCbCr→RGB conversion in the fragment shader.
-    ///
-    /// This is a low-level API. Most callers should use the [`surface()`] element.
+    /// Paint a validated NV12 texture source into the scene.
     #[cfg(feature = "wgpu")]
-    pub fn paint_surface_with_nv12_texture(
+    pub fn paint_surface_with_nv12_source(
         &mut self,
         bounds: Bounds<Pixels>,
-        y_texture: Arc<wgpu::Texture>,
-        cb_cr_texture: Arc<wgpu::Texture>,
-        native_size: Size<DevicePixels>,
+        source: crate::Nv12TextureSource,
     ) {
         use crate::{PaintSurface, SurfaceContent};
 
@@ -4844,11 +4833,7 @@ impl Window {
             order: 0,
             bounds,
             content_mask,
-            content: SurfaceContent::WgpuTextureNv12 {
-                y_texture,
-                cb_cr_texture,
-                native_size,
-            },
+            content: SurfaceContent::WgpuNv12(source),
         });
     }
 
@@ -6656,7 +6641,7 @@ impl Window {
 
     /// Returns a handle to the GPU resources used by this window's renderer.
     ///
-    /// The returned [`GpuContextHandle`] provides access to the [`wgpu::Device`],
+    /// The returned [`WgpuContextHandle`] provides access to the [`wgpu::Device`],
     /// [`wgpu::Instance`], [`wgpu::Adapter`], and [`wgpu::Queue`] that GPUI
     /// uses for rendering. Use this to create [`wgpu::Texture`]s that are
     /// compatible with [`surface()`].
@@ -6664,19 +6649,19 @@ impl Window {
     /// Returns `None` when the platform uses a non-wgpu backend (DirectX, Metal)
     /// or before GPU resources have been initialized by the first frame.
     #[cfg(feature = "wgpu")]
-    pub fn gpu_context(&self) -> Option<GpuContextHandle> {
+    pub fn gpu_context(&self) -> Option<WgpuContextHandle> {
         self.platform_window.gpu_context()
     }
 
-    /// Submit an external NV12 frame to this window's Linux wgpu renderer.
-    #[cfg(all(target_os = "linux", feature = "wgpu"))]
+    /// Stage an external frame for this window's next normal wgpu submission.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "wgpu"))]
     pub fn submit_external_frame(&self, request: ExternalFrameRequest) -> ExternalFrameOutcome {
         self.platform_window.submit_external_frame(request)
     }
 
     /// Take the one-shot outcome produced while the renderer consumed an
     /// external frame request.
-    #[cfg(all(target_os = "linux", feature = "wgpu"))]
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "wgpu"))]
     pub fn take_external_frame_outcome(&self) -> Option<ExternalFrameOutcome> {
         self.platform_window.take_external_frame_outcome()
     }

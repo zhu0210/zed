@@ -480,22 +480,15 @@ impl MacPlatform {
     }
 
     #[cfg(feature = "wgpu-renderer")]
-    fn gpu_context(&self) -> Option<gpui::GpuContextHandle> {
+    fn gpu_context(&self) -> Option<gpui::WgpuContextHandle> {
         let guard = self.0.lock();
         let gpu_ctx = guard.renderer_context.borrow();
         let wgpu = gpu_ctx.as_ref()?;
-        Some(gpui::GpuContextHandle {
-            device: wgpu.device.clone(),
-            queue: wgpu.queue.clone(),
-            instance: wgpu.instance.clone(),
-            adapter: wgpu.adapter.clone(),
-            color_texture_format: wgpu.color_texture_format(),
-            supports_dual_source_blending: wgpu.supports_dual_source_blending(),
-        })
+        wgpu.handle().ok()
     }
 
     #[cfg(feature = "wgpu-renderer")]
-    fn set_gpu_context(&self, handle: gpui::GpuContextHandle) -> anyhow::Result<()> {
+    fn set_gpu_context(&self, descriptor: gpui::WgpuContextDescriptor) -> anyhow::Result<()> {
         let mut guard = self.0.lock();
         let gpu_ctx = guard.renderer_context.borrow();
         if gpu_ctx.is_some() {
@@ -504,7 +497,7 @@ impl MacPlatform {
             );
         }
         drop(gpu_ctx);
-        *guard.renderer_context.borrow_mut() = Some(WgpuContext::from_handle(handle));
+        *guard.renderer_context.borrow_mut() = Some(WgpuContext::from_descriptor(descriptor));
         Ok(())
     }
 }
@@ -1285,7 +1278,7 @@ impl Platform for MacPlatform {
 /// Import a [`core_video::pixel_buffer::CVPixelBuffer`] into a wgpu texture
 /// for compositing via [`gpui::surface`].
 ///
-/// Accepts a [`gpui::GpuContextHandle`] (obtained from
+/// Accepts a [`gpui::WgpuContextHandle`] (obtained from
 /// [`gpui::Window::gpu_context()`]) so callers don't need access to the
 /// platform-internal `GpuContext` type.
 ///
@@ -1304,21 +1297,26 @@ impl Platform for MacPlatform {
 /// ```ignore
 /// let gpu = window.gpu_context().unwrap();
 /// let texture = import_cv_pixel_buffer_to_wgpu(&pixel_buffer, &gpu).unwrap();
-/// let descriptor = cv_pixel_buffer_descriptor(&pixel_buffer);
-/// surface((texture, descriptor)).object_fit(ObjectFit::Contain)
+/// let source = RgbaTextureSource::new(
+///     texture,
+///     native_size,
+///     GpuTextureAlphaMode::Premultiplied,
+///     GpuTextureColorSpace::Srgb,
+/// )?;
+/// surface(source).object_fit(ObjectFit::Contain)
 /// ```
 #[cfg(feature = "wgpu-renderer")]
 pub fn import_cv_pixel_buffer_to_wgpu(
     pixel_buffer: &core_video::pixel_buffer::CVPixelBuffer,
-    gpu_handle: &gpui::GpuContextHandle,
+    gpu_handle: &gpui::WgpuContextHandle,
 ) -> Option<std::sync::Arc<gpui_wgpu::wgpu::Texture>> {
     use core_video::pixel_buffer::kCVPixelFormatType_32BGRA;
     use gpui_wgpu::wgpu;
 
     log::debug!(
         "import_cv_pixel_buffer_to_wgpu: format={:?}, dual_src_blend={}",
-        gpu_handle.color_texture_format,
-        gpu_handle.supports_dual_source_blending
+        gpu_handle.color_texture_format(),
+        gpu_handle.supports_dual_source_blending()
     );
 
     let wgpu_format = match pixel_buffer.get_pixel_format() {
@@ -1374,7 +1372,7 @@ pub fn import_cv_pixel_buffer_to_wgpu(
 #[cfg(all(feature = "wgpu-renderer", feature = "iosurface-interop"))]
 fn import_via_iosurface(
     pixel_buffer: &core_video::pixel_buffer::CVPixelBuffer,
-    gpu_handle: &gpui::GpuContextHandle,
+    gpu_handle: &gpui::WgpuContextHandle,
     wgpu_format: gpui_wgpu::wgpu::TextureFormat,
     width: u32,
     height: u32,
@@ -1387,7 +1385,7 @@ fn import_via_iosurface(
 
     log::debug!(
         "import_via_iosurface: trying IOSurface import via device {:?}",
-        gpu_handle.color_texture_format
+        gpu_handle.color_texture_format()
     );
 
     // Extract IOSurface from the CVPixelBuffer.
@@ -1409,7 +1407,7 @@ fn import_via_iosurface(
     );
 
     // Access the Metal HAL device.
-    let metal_hal = match unsafe { gpu_handle.device.as_hal::<wgpu::hal::api::Metal>() } {
+    let metal_hal = match unsafe { gpu_handle.device().as_hal::<wgpu::hal::api::Metal>() } {
         Some(d) => d,
         None => {
             log::debug!(
@@ -1515,7 +1513,7 @@ fn import_via_iosurface(
 #[cfg(feature = "wgpu-renderer")]
 fn import_via_cpu_copy(
     pixel_buffer: &core_video::pixel_buffer::CVPixelBuffer,
-    gpu_handle: &gpui::GpuContextHandle,
+    gpu_handle: &gpui::WgpuContextHandle,
     wgpu_format: gpui_wgpu::wgpu::TextureFormat,
     width: u32,
     height: u32,
@@ -1525,20 +1523,22 @@ fn import_via_cpu_copy(
 
     let bytes_per_row = pixel_buffer.get_bytes_per_row() as u32;
 
-    let texture = gpu_handle.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("cv_pixel_buffer_cpu_import"),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu_format,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
+    let texture = gpu_handle
+        .device()
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("cv_pixel_buffer_cpu_import"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu_format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
 
     let lock_result = pixel_buffer.lock_base_address(kCVPixelBufferLock_ReadOnly);
     if lock_result != 0 {
@@ -1569,7 +1569,7 @@ fn import_via_cpu_copy(
         data.len()
     );
 
-    gpu_handle.queue.write_texture(
+    gpu_handle.queue().write_texture(
         wgpu::TexelCopyTextureInfo {
             texture: &texture,
             mip_level: 0,
@@ -1593,8 +1593,6 @@ fn import_via_cpu_copy(
     drop(data);
 
     log::debug!("import_via_cpu_copy: CPU upload complete");
-
-    println!("fallback");
 
     Some(texture)
 }

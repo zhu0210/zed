@@ -3,8 +3,8 @@
 //! Two paths are shown side-by-side:
 //!
 //! 1. **Direct**: `surface(pixel_buffer)` — zero-copy Metal path
-//! 2. **wgpu import**: `import_cv_pixel_buffer_to_wgpu(&pb, &gpu)` →
-//!    `surface((texture, desc))` — cross-platform wgpu path
+//! 2. **wgpu import**: `import_cv_pixel_buffer_to_wgpu(&pb, &gpu)` wrapped
+//!    in a validated RGBA surface source
 //!
 //! ```sh
 //! cargo run -p gpui_macos --example cv_interop
@@ -20,8 +20,8 @@ use core_video::pixel_buffer::{
     kCVPixelFormatType_32BGRA,
 };
 use gpui::{
-    App, Application, Bounds, Context, DevicePixels, GpuTextureColorSpace, GpuTextureDescriptor,
-    GpuTextureFormat, IntoElement, ObjectFit, ParentElement, Render, SharedString, Styled, Window,
+    App, Application, Bounds, Context, DevicePixels, GpuTextureAlphaMode, GpuTextureColorSpace,
+    IntoElement, ObjectFit, ParentElement, Render, RgbaTextureSource, SharedString, Styled, Window,
     WindowBounds, WindowOptions, div, prelude::*, px, rgb, size, surface,
 };
 use gpui_macos::MacPlatform;
@@ -84,17 +84,6 @@ fn create_test_pixel_buffer() -> CVPixelBuffer {
     pb
 }
 
-fn make_descriptor(pb: &CVPixelBuffer) -> GpuTextureDescriptor {
-    GpuTextureDescriptor {
-        size: size(
-            DevicePixels::from(pb.get_width() as i32),
-            DevicePixels::from(pb.get_height() as i32),
-        ),
-        format: GpuTextureFormat::Bgra8Unorm,
-        color_space: GpuTextureColorSpace::Srgb,
-    }
-}
-
 impl Render for CvInteropDemo {
     fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         if self.test_pixel_buffer.is_none() {
@@ -112,12 +101,13 @@ impl Render for CvInteropDemo {
                     log::info!(
                         "cv_interop: importing CVPixelBuffer to wgpu. \
                          format={:?}, dual_src={}",
-                        gpu.color_texture_format,
-                        gpu.supports_dual_source_blending
+                        gpu.color_texture_format(),
+                        gpu.supports_dual_source_blending()
                     );
                     self.device_info = SharedString::from(format!(
                         "wgpu: {:?} dual_src={}",
-                        gpu.color_texture_format, gpu.supports_dual_source_blending
+                        gpu.color_texture_format(),
+                        gpu.supports_dual_source_blending()
                     ));
                     self.imported_texture = gpui_macos::import_cv_pixel_buffer_to_wgpu(pb, &gpu);
                     if self.imported_texture.is_some() {
@@ -131,7 +121,18 @@ impl Render for CvInteropDemo {
             }
         }
 
-        let descriptor = self.test_pixel_buffer.as_ref().map(make_descriptor);
+        let imported_source = self.imported_texture.as_ref().and_then(|texture| {
+            RgbaTextureSource::new(
+                texture.clone(),
+                size(
+                    DevicePixels::from(PB_WIDTH as i32),
+                    DevicePixels::from(PB_HEIGHT as i32),
+                ),
+                GpuTextureAlphaMode::Premultiplied,
+                GpuTextureColorSpace::Srgb,
+            )
+            .ok()
+        });
 
         div()
             .flex()
@@ -203,7 +204,7 @@ impl Render for CvInteropDemo {
                                 div()
                                     .text_sm()
                                     .text_color(rgb(0x9399b2))
-                                    .child("wgpu Import — surface((texture, desc))"),
+                                    .child("wgpu Import — validated RGBA source"),
                             )
                             .child(
                                 div()
@@ -214,17 +215,13 @@ impl Render for CvInteropDemo {
                                     .border_color(rgb(0x45475a))
                                     .rounded_md()
                                     .overflow_hidden()
-                                    .child(
-                                        if let (Some(tex), Some(desc)) =
-                                            (&self.imported_texture, &descriptor)
-                                        {
-                                            surface((tex.clone(), *desc))
-                                                .object_fit(ObjectFit::Contain)
-                                                .into_any_element()
-                                        } else {
-                                            fallback("Importing via wgpu...").into_any_element()
-                                        },
-                                    ),
+                                    .child(if let Some(ref source) = imported_source {
+                                        surface(source.clone())
+                                            .object_fit(ObjectFit::Contain)
+                                            .into_any_element()
+                                    } else {
+                                        fallback("Importing via wgpu...").into_any_element()
+                                    }),
                             ),
                     ),
             )

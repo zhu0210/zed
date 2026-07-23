@@ -5,12 +5,15 @@ use anyhow::{Context as _, Result};
 #[cfg(target_os = "linux")]
 use ash::{khr::external_semaphore_fd, vk};
 use bytemuck::{Pod, Zeroable};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use gpui::ExternalFrameRequest;
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, ExternalFrameAcquisition, ExternalFrameOutcome, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, DevicePixels, ExternalFrameAcquisition,
+    ExternalFrameOutcome, GpuSpecs, Path, Point, PrimitiveBatch, ScaledPixels, Scene, Size,
+    get_gamma_correction_ratios,
 };
 #[cfg(target_os = "linux")]
-use gpui::{ExternalFrameRequest, ExternalNv12Frame, ExternalOwnership};
+use gpui::{ExternalNv12Frame, ExternalOwnership};
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -18,7 +21,7 @@ use std::cell::RefCell;
 use std::num::NonZeroU64;
 use std::ops::Range;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
@@ -60,8 +63,7 @@ fn least_common_multiple(left: u64, right: u64) -> u64 {
 }
 
 #[cfg(target_os = "linux")]
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
-
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -92,7 +94,124 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
-    yuv_to_rgb: [[f32; 4]; 4],
+    ycbcr_to_rgb: [[f32; 4]; 4],
+    transfer: u32,
+    _padding: [u32; 3],
+}
+
+const SURFACE_CACHE_LIMIT: usize = 256;
+
+#[derive(Default)]
+struct SurfaceCache {
+    slots: Vec<SurfaceSlot>,
+    used: usize,
+}
+
+impl SurfaceCache {
+    fn begin_frame(&mut self) {
+        self.slots.truncate(self.used);
+        self.used = 0;
+    }
+}
+
+struct SurfaceSlot {
+    uniform: wgpu::Buffer,
+    binding: wgpu::BindGroup,
+    y: Weak<wgpu::Texture>,
+    uv: Weak<wgpu::Texture>,
+    multiplanar: bool,
+}
+
+impl SurfaceSlot {
+    fn new(
+        resources: &WgpuResources,
+        y: &Arc<wgpu::Texture>,
+        uv: &Arc<wgpu::Texture>,
+        multiplanar: bool,
+    ) -> Self {
+        let uniform = resources.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("surface_uniform"),
+            size: std::mem::size_of::<SurfaceParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let binding = Self::binding(resources, &uniform, y, uv, multiplanar);
+        Self {
+            uniform,
+            binding,
+            y: Arc::downgrade(y),
+            uv: Arc::downgrade(uv),
+            multiplanar,
+        }
+    }
+
+    fn binding(
+        resources: &WgpuResources,
+        uniform: &wgpu::Buffer,
+        y: &wgpu::Texture,
+        uv: &wgpu::Texture,
+        multiplanar: bool,
+    ) -> wgpu::BindGroup {
+        let y_descriptor = if multiplanar {
+            nv12_plane_view_descriptor(wgpu::TextureAspect::Plane0).unwrap_or_default()
+        } else {
+            wgpu::TextureViewDescriptor::default()
+        };
+        let uv_descriptor = if multiplanar {
+            nv12_plane_view_descriptor(wgpu::TextureAspect::Plane1).unwrap_or_default()
+        } else {
+            wgpu::TextureViewDescriptor::default()
+        };
+        let y_view = y.create_view(&y_descriptor);
+        let uv_view = if std::ptr::eq(y, uv) && !multiplanar {
+            y_view.clone()
+        } else {
+            uv.create_view(&uv_descriptor)
+        };
+        resources
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("surface_bind_group"),
+                layout: &resources.bind_group_layouts.surfaces,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&y_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&uv_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
+                    },
+                ],
+            })
+    }
+
+    fn update_textures(
+        &mut self,
+        resources: &WgpuResources,
+        y: &Arc<wgpu::Texture>,
+        uv: &Arc<wgpu::Texture>,
+        multiplanar: bool,
+    ) {
+        if self.y.as_ptr() == Arc::as_ptr(y)
+            && self.uv.as_ptr() == Arc::as_ptr(uv)
+            && self.multiplanar == multiplanar
+        {
+            return;
+        }
+        self.binding = Self::binding(resources, &self.uniform, y, uv, multiplanar);
+        self.y = Arc::downgrade(y);
+        self.uv = Arc::downgrade(uv);
+        self.multiplanar = multiplanar;
+    }
 }
 
 impl SurfaceParams {
@@ -104,7 +223,9 @@ impl SurfaceParams {
         Self {
             bounds,
             content_mask,
-            yuv_to_rgb: transform.yuv_to_rgb,
+            ycbcr_to_rgb: transform.yuv_to_rgb,
+            transfer: 0,
+            _padding: [0; 3],
         }
     }
 }
@@ -127,11 +248,70 @@ fn nv12_plane_view_descriptor(
     })
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct SurfaceInstance {
-    bounds: PodBounds,
-    content_mask: PodBounds,
+fn video_transfer_kind(transfer: gpui::VideoTransferFunction) -> u32 {
+    match transfer {
+        gpui::VideoTransferFunction::Srgb => 0,
+        gpui::VideoTransferFunction::Bt709 => 1,
+        gpui::VideoTransferFunction::Bt2020Ten => 2,
+    }
+}
+
+fn ycbcr_to_rgb_matrix(
+    matrix: gpui::VideoColorMatrix,
+    range: gpui::VideoColorRange,
+) -> [[f32; 4]; 4] {
+    let (r_cr, g_cb, g_cr, b_cb) = match matrix {
+        gpui::VideoColorMatrix::Bt601 => (1.402, -0.344_136, -0.714_136, 1.772),
+        gpui::VideoColorMatrix::Bt709 => (1.5748, -0.187_324, -0.468_124, 1.8556),
+        gpui::VideoColorMatrix::Bt2020 => (1.4746, -0.164_553, -0.571_353, 1.8814),
+    };
+    let (y_scale, y_offset) = match range {
+        gpui::VideoColorRange::Full => (1.0, 0.0),
+        gpui::VideoColorRange::Limited => (255.0 / 219.0, 16.0 / 255.0),
+    };
+    let chroma_scale = match range {
+        gpui::VideoColorRange::Full => 1.0,
+        gpui::VideoColorRange::Limited => 255.0 / 224.0,
+    };
+    let r_cr = r_cr * chroma_scale;
+    let g_cb = g_cb * chroma_scale;
+    let g_cr = g_cr * chroma_scale;
+    let b_cb = b_cb * chroma_scale;
+
+    [
+        [y_scale, y_scale, y_scale, 0.0],
+        [0.0, g_cb, b_cb, 0.0],
+        [r_cr, g_cr, 0.0, 0.0],
+        [
+            -y_scale * y_offset - 0.5 * r_cr,
+            -y_scale * y_offset - 0.5 * (g_cb + g_cr),
+            -y_scale * y_offset - 0.5 * b_cb,
+            1.0,
+        ],
+    ]
+}
+
+fn clamp_surface_scissor(
+    bounds: Bounds<ScaledPixels>,
+    target_width: u32,
+    target_height: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    let target_width = target_width as f32;
+    let target_height = target_height as f32;
+    let left = bounds.origin.x.0.max(0.0).min(target_width);
+    let top = bounds.origin.y.0.max(0.0).min(target_height);
+    let right = (bounds.origin.x.0 + bounds.size.width.0)
+        .max(0.0)
+        .min(target_width);
+    let bottom = (bounds.origin.y.0 + bounds.size.height.0)
+        .max(0.0)
+        .min(target_height);
+
+    let x = left.floor() as u32;
+    let y = top.floor() as u32;
+    let right = right.ceil() as u32;
+    let bottom = bottom.ceil() as u32;
+    (right > x && bottom > y).then_some((x, y, right - x, bottom - y))
 }
 
 #[repr(C)]
@@ -291,7 +471,7 @@ impl PreparedExternalFrame {
     /// The sync file remains pending until the next normal renderer submit;
     /// this lets the draw call stage the wait in wgpu's queue ordering.
     pub fn from_vulkan(
-        context: &gpui::GpuContextHandle,
+        context: &gpui::WgpuContextHandle,
         mut frame: VulkanExternalFrame,
     ) -> anyhow::Result<Self> {
         ensure_external_frame_initial_state(frame.initial_state)?;
@@ -305,14 +485,14 @@ impl PreparedExternalFrame {
                 && frame.size.depth_or_array_layers == 1,
             "external frame must be a non-empty 2D image"
         );
-        if context.adapter.get_info().backend != wgpu::Backend::Vulkan {
+        if context.adapter().get_info().backend != wgpu::Backend::Vulkan {
             anyhow::bail!("Vulkan external frames require a Vulkan adapter");
         }
 
         // SAFETY: the adapter and device come from the same wgpu context. The
         // producer owns the image and promises that its descriptor and initial
         // Vulkan layout match these values until wgpu releases the texture.
-        let hal_device = unsafe { context.device.as_hal::<wgpu::hal::api::Vulkan>() }
+        let hal_device = unsafe { context.device().as_hal::<wgpu::hal::api::Vulkan>() }
             .ok_or_else(|| anyhow::anyhow!("Vulkan HAL device is unavailable"))?;
         if !hal_device
             .enabled_device_extensions()
@@ -386,7 +566,7 @@ impl PreparedExternalFrame {
         // wgpu-tracked consumer state established after the external GENERAL-layout acquire.
         let texture = unsafe {
             context
-                .device
+                .device()
                 .create_texture_from_hal::<wgpu::hal::api::Vulkan>(
                     hal_texture,
                     &texture_descriptor,
@@ -404,12 +584,12 @@ impl PreparedExternalFrame {
 
     #[cfg(target_os = "linux")]
     fn from_external_nv12(
-        context: &gpui::GpuContextHandle,
+        context: &gpui::WgpuContextHandle,
         frame: ExternalNv12Frame,
     ) -> Result<Self, ExternalFrameOutcome> {
-        if context.adapter.get_info().backend != wgpu::Backend::Vulkan
+        if context.adapter().get_info().backend != wgpu::Backend::Vulkan
             || !context
-                .device
+                .device()
                 .features()
                 .contains(wgpu::Features::TEXTURE_FORMAT_NV12)
         {
@@ -418,7 +598,7 @@ impl PreparedExternalFrame {
 
         // SAFETY: the caller constructed the frame for this renderer device and
         // promised that the texture is an initialized Vulkan NV12 image.
-        let Some(hal_device) = (unsafe { context.device.as_hal::<wgpu::hal::api::Vulkan>() })
+        let Some(hal_device) = (unsafe { context.device().as_hal::<wgpu::hal::api::Vulkan>() })
         else {
             return Err(ExternalFrameOutcome::Unsupported);
         };
@@ -565,19 +745,35 @@ impl PreparedExternalFrame {
 
 enum PendingExternalFrame {
     Prepared(PreparedExternalFrame),
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    Rgba {
+        commands: Option<wgpu::CommandBuffer>,
+        texture: Arc<wgpu::Texture>,
+    },
     #[cfg(target_os = "linux")]
     Nv12(ExternalNv12Frame),
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl ExternalFrameState<PendingExternalFrame> {
-    fn selection_for_scene(&self, scene: &Scene) -> Option<ExternalFrameSlot> {
+    fn selection_for_scene(
+        &self,
+        scene: &Scene,
+        viewport: (u32, u32),
+    ) -> Option<ExternalFrameSlot> {
         self.select_matching(|frame| match frame {
-            PendingExternalFrame::Prepared(frame) => scene_contains_texture(scene, frame.texture()),
+            PendingExternalFrame::Prepared(frame) => {
+                scene_contains_texture(scene, frame.texture(), viewport)
+            }
+            PendingExternalFrame::Rgba { texture, .. } => {
+                scene_contains_texture(scene, texture, viewport)
+            }
+            #[cfg(target_os = "linux")]
             PendingExternalFrame::Nv12(_) => false,
         })
     }
 
+    #[cfg(target_os = "linux")]
     fn selected(&self, slot: ExternalFrameSlot) -> Option<&PendingExternalFrame> {
         match slot {
             ExternalFrameSlot::Latest => self.latest.as_ref(),
@@ -592,21 +788,28 @@ impl ExternalFrameState<PendingExternalFrame> {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn selected_is_external(&self, slot: ExternalFrameSlot) -> bool {
         matches!(self.selected(slot), Some(PendingExternalFrame::Prepared(frame)) if frame.is_external())
     }
 
+    #[cfg(target_os = "linux")]
     fn clear_selected_latest(&mut self, slot: ExternalFrameSlot) {
         if slot == ExternalFrameSlot::Latest {
             self.latest = None;
         }
     }
 
-    fn prepare_frame(&mut self, context: Option<&gpui::GpuContextHandle>) -> ExternalFrameOutcome {
+    #[cfg(target_os = "linux")]
+    fn prepare_frame(&mut self, context: Option<&gpui::WgpuContextHandle>) -> ExternalFrameOutcome {
         let Some(frame) = self.latest.take() else {
             return ExternalFrameOutcome::Accepted;
         };
         let frame = match frame {
+            frame @ PendingExternalFrame::Rgba { .. } => {
+                self.latest = Some(frame);
+                return ExternalFrameOutcome::Accepted;
+            }
             PendingExternalFrame::Prepared(frame) => frame,
             PendingExternalFrame::Nv12(frame) => {
                 let Some(context) = context else {
@@ -623,6 +826,7 @@ impl ExternalFrameState<PendingExternalFrame> {
         ExternalFrameOutcome::Accepted
     }
 
+    #[cfg(target_os = "linux")]
     fn import_sync(
         &mut self,
         slot: ExternalFrameSlot,
@@ -645,6 +849,7 @@ impl ExternalFrameState<PendingExternalFrame> {
         ExternalFrameOutcome::Accepted
     }
 
+    #[cfg(target_os = "linux")]
     fn encode_acquire(
         &mut self,
         slot: ExternalFrameSlot,
@@ -655,7 +860,9 @@ impl ExternalFrameState<PendingExternalFrame> {
         };
         let frame = match frame {
             PendingExternalFrame::Prepared(frame) => frame,
-            PendingExternalFrame::Nv12(_) => return ExternalFrameOutcome::Accepted,
+            PendingExternalFrame::Nv12(_) | PendingExternalFrame::Rgba { .. } => {
+                return ExternalFrameOutcome::Accepted;
+            }
         };
         if frame.encode_acquire_ownership(encoder).is_err() {
             self.clear_selected_latest(slot);
@@ -664,6 +871,7 @@ impl ExternalFrameState<PendingExternalFrame> {
         ExternalFrameOutcome::Accepted
     }
 
+    #[cfg(target_os = "linux")]
     fn encode_release(
         &mut self,
         slot: ExternalFrameSlot,
@@ -674,7 +882,9 @@ impl ExternalFrameState<PendingExternalFrame> {
         };
         let frame = match frame {
             PendingExternalFrame::Prepared(frame) => frame,
-            PendingExternalFrame::Nv12(_) => return ExternalFrameOutcome::FatalFailure,
+            PendingExternalFrame::Nv12(_) | PendingExternalFrame::Rgba { .. } => {
+                return ExternalFrameOutcome::FatalFailure;
+            }
         };
         if frame.encode_release_ownership(encoder).is_err() {
             self.clear_selected_latest(slot);
@@ -683,21 +893,41 @@ impl ExternalFrameState<PendingExternalFrame> {
         ExternalFrameOutcome::Accepted
     }
 
+    // Take conversion work only after all fallible scene recording has succeeded.
+    // An unselected frame retains its commands for a future draw.
+    fn take_rgba_commands(
+        &mut self,
+        slot: Option<ExternalFrameSlot>,
+    ) -> Option<wgpu::CommandBuffer> {
+        match self.selected_mut(slot?)? {
+            PendingExternalFrame::Rgba { commands, .. } => commands.take(),
+            _ => None,
+        }
+    }
+
     fn commit_after_submission_with_queue(
         &mut self,
         slot: Option<ExternalFrameSlot>,
         queue: &wgpu::Queue,
     ) -> bool {
+        #[cfg(not(target_os = "linux"))]
+        let _ = queue;
         match slot {
             Some(ExternalFrameSlot::Latest) => {
-                let Some(PendingExternalFrame::Prepared(mut frame)) = self.latest.take() else {
+                let Some(mut frame) = self.latest.take() else {
                     return false;
                 };
-                frame.on_submitted(queue);
-                self.displayed = Some(PendingExternalFrame::Prepared(frame));
+                #[cfg(target_os = "linux")]
+                if let PendingExternalFrame::Prepared(frame) = &mut frame {
+                    frame.on_submitted(queue);
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = &mut frame;
+                self.displayed = Some(frame);
                 true
             }
             Some(ExternalFrameSlot::Displayed) => {
+                #[cfg(target_os = "linux")]
                 if let Some(PendingExternalFrame::Prepared(frame)) = self.displayed.as_mut() {
                     frame.on_submitted(queue);
                 }
@@ -708,15 +938,49 @@ impl ExternalFrameState<PendingExternalFrame> {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn scene_contains_texture(scene: &Scene, texture: &Arc<wgpu::Texture>) -> bool {
-    scene.surfaces.iter().any(|surface| match &surface.content {
-        gpui::SurfaceContent::WgpuTexture(candidate) => Arc::ptr_eq(candidate, texture),
-        gpui::SurfaceContent::WgpuTextureNv12Multiplanar {
-            texture: candidate, ..
-        } => Arc::ptr_eq(candidate, texture),
-        #[allow(unreachable_patterns)]
-        _ => false,
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn scene_contains_texture(
+    scene: &Scene,
+    texture: &Arc<wgpu::Texture>,
+    viewport: (u32, u32),
+) -> bool {
+    scene.batches().any(|batch| {
+        let PrimitiveBatch::Surfaces(range) = batch else {
+            return false;
+        };
+        scene.surfaces[range].iter().any(|surface| {
+            // Match draw_surfaces' visibility checks: staging a clipped or hidden
+            // texture must not consume conversion commands or acknowledge it.
+            if surface.bounds.size.width.0 <= 0.0
+                || surface.bounds.size.height.0 <= 0.0
+                || clamp_surface_scissor(surface.content_mask.bounds, viewport.0, viewport.1)
+                    .is_none()
+            {
+                return false;
+            }
+            match &surface.content {
+                gpui::SurfaceContent::WgpuRgba(source) => Arc::ptr_eq(source.texture(), texture),
+                gpui::SurfaceContent::WgpuNv12(source) => {
+                    Arc::ptr_eq(source.y_texture(), texture)
+                        || Arc::ptr_eq(source.cb_cr_texture(), texture)
+                }
+                gpui::SurfaceContent::WgpuTextureNv12 {
+                    y_texture,
+                    cb_cr_texture,
+                    ..
+                }
+                | gpui::SurfaceContent::WgpuTextureNv12WithColorTransform {
+                    y_texture,
+                    cb_cr_texture,
+                    ..
+                } => Arc::ptr_eq(y_texture, texture) || Arc::ptr_eq(cb_cr_texture, texture),
+                gpui::SurfaceContent::WgpuTextureNv12Multiplanar {
+                    texture: candidate, ..
+                } => Arc::ptr_eq(candidate, texture),
+                #[allow(unreachable_patterns)]
+                _ => false,
+            }
+        })
     })
 }
 
@@ -747,6 +1011,38 @@ fn classify_external_sync_error(error: vk::Result) -> ExternalFrameOutcome {
         | vk::Result::ERROR_OUT_OF_HOST_MEMORY => ExternalFrameOutcome::FatalFailure,
         _ => ExternalFrameOutcome::TransientFailure,
     }
+}
+
+// Linux UAPI sync_file_info from <linux/sync_file.h>. A zero fence count
+// requests only metadata, with no array allocation and no wait for completion.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Default)]
+struct SyncFileInfo {
+    name: [u8; 32],
+    status: i32,
+    flags: u32,
+    num_fences: u32,
+    pad: u32,
+    sync_fence_info: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn validate_sync_file(fd: &OwnedFd) -> Result<(), vk::Result> {
+    let mut info = SyncFileInfo::default();
+    // SAFETY: fd is owned and live for the ioctl. info has the Linux UAPI layout;
+    // num_fences and sync_fence_info are zero, so the kernel writes only info.
+    let result = unsafe {
+        libc::ioctl(
+            fd.as_raw_fd(),
+            libc::_IOWR::<SyncFileInfo>(u32::from(b'>'), 4),
+            &mut info,
+        )
+    };
+    if result < 0 || info.status < 0 {
+        return Err(vk::Result::ERROR_INVALID_EXTERNAL_HANDLE);
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -780,6 +1076,9 @@ impl VulkanExternalSync {
             .fd
             .take()
             .ok_or(vk::Result::ERROR_INVALID_EXTERNAL_HANDLE)?;
+        // Some Vulkan drivers accept arbitrary descriptors as SYNC_FD payloads.
+        // Reject them before importing or adding a wait to the shared queue.
+        validate_sync_file(&fd)?;
         // SAFETY: `self.device` is the live Vulkan device associated with the HAL queue.
         let semaphore = unsafe {
             self.device
@@ -845,7 +1144,7 @@ struct ExternalFrameState<T> {
     displayed: Option<T>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExternalFrameSlot {
     Latest,
@@ -888,7 +1187,7 @@ impl<T> ExternalFrameState<T> {
         outcome
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn select_matching(&self, matches: impl Fn(&T) -> bool) -> Option<ExternalFrameSlot> {
         if let Some(frame) = self.latest.as_ref() {
             if matches(frame) {
@@ -903,7 +1202,7 @@ impl<T> ExternalFrameState<T> {
         None
     }
 
-    #[cfg(any(test, not(target_os = "linux")))]
+    #[cfg(any(test, not(any(target_os = "linux", target_os = "android"))))]
     fn commit_after_submission(&mut self) -> bool {
         let Some(frame) = self.latest.take() else {
             return false;
@@ -1014,6 +1313,7 @@ pub struct WgpuRenderer {
     compositor_gpu: Option<CompositorGpuHint>,
     resources: Option<WgpuResources>,
     surface_config: wgpu::SurfaceConfiguration,
+    surface_cache: RefCell<SurfaceCache>,
     atlas: Arc<WgpuAtlas>,
     path_globals_offset: u64,
     gamma_offset: u64,
@@ -1054,18 +1354,11 @@ impl WgpuRenderer {
     ///
     /// Returns `None` if the GPU context has not been initialized yet
     /// (before the first frame).
-    pub fn gpu_context_handle(&self) -> Option<gpui::GpuContextHandle> {
+    pub fn gpu_context_handle(&self) -> Option<gpui::WgpuContextHandle> {
         let gpu_ctx = self.context.as_ref()?;
         let ctx = gpu_ctx.borrow();
         let wgpu = ctx.as_ref()?;
-        Some(gpui::GpuContextHandle {
-            device: wgpu.device.clone(),
-            queue: wgpu.queue.clone(),
-            instance: wgpu.instance.clone(),
-            adapter: wgpu.adapter.clone(),
-            color_texture_format: wgpu.color_texture_format(),
-            supports_dual_source_blending: wgpu.supports_dual_source_blending(),
-        })
+        wgpu.handle().ok()
     }
 
     /// Stage the latest prepared external frame or report its acquisition
@@ -1089,13 +1382,24 @@ impl WgpuRenderer {
         outcome
     }
 
-    /// Stage a typed external NV12 request for the next normal submission.
-    #[cfg(target_os = "linux")]
+    /// Stage external work for the next scene that samples its texture.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn submit_external_frame_request(
         &mut self,
         request: ExternalFrameRequest,
     ) -> ExternalFrameOutcome {
         let (acquisition, frame) = match request {
+            ExternalFrameRequest::PreparedRgba(frame) => {
+                let (texture, commands) = frame.into_parts();
+                (
+                    ExternalFrameAcquisition::Prepared,
+                    Some(PendingExternalFrame::Rgba {
+                        commands: Some(commands),
+                        texture,
+                    }),
+                )
+            }
+            #[cfg(target_os = "linux")]
             ExternalFrameRequest::Prepared(frame) => (
                 ExternalFrameAcquisition::Prepared,
                 Some(PendingExternalFrame::Nv12(frame)),
@@ -1108,7 +1412,8 @@ impl WgpuRenderer {
         let outcome = self
             .external_frames
             .stage(self.adapter_info.backend, acquisition, frame);
-        self.last_external_frame_outcome = Some(outcome);
+        self.last_external_frame_outcome =
+            (outcome != ExternalFrameOutcome::Accepted).then_some(outcome);
         outcome
     }
 
@@ -1118,7 +1423,7 @@ impl WgpuRenderer {
     /// external queue family; their completion callback retains the texture and
     /// producer lease. A never-submitted latest frame remains producer-owned, so
     /// dropping it needs no barrier or submission.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn clear_external_frame(&mut self) -> ExternalFrameOutcome {
         self.external_frames.clear();
         self.last_external_frame_outcome = Some(ExternalFrameOutcome::Accepted);
@@ -1129,6 +1434,8 @@ impl WgpuRenderer {
     pub fn displayed_external_frame(&self) -> Option<&PreparedExternalFrame> {
         match self.external_frames.displayed()? {
             PendingExternalFrame::Prepared(frame) => Some(frame),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            PendingExternalFrame::Rgba { .. } => None,
             #[cfg(target_os = "linux")]
             PendingExternalFrame::Nv12(_) => None,
         }
@@ -1215,7 +1522,7 @@ impl WgpuRenderer {
         config: WgpuSurfaceConfig,
     ) -> anyhow::Result<Self> {
         let surface = context
-            .instance
+            .instance()
             .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
             .map_err(|e| anyhow::anyhow!("Failed to create surface: {e}"))?;
         Self::new_from_surface(context, surface, config)
@@ -1317,6 +1624,7 @@ impl WgpuRenderer {
                 .unwrap_or(wgpu::PresentMode::Fifo),
             desired_maximum_frame_latency: 2,
             alpha_mode,
+
             view_formats: vec![],
         };
         // Configure the surface immediately. The adapter selection process already validated
@@ -1480,6 +1788,7 @@ impl WgpuRenderer {
             compositor_gpu,
             resources: Some(resources),
             surface_config,
+            surface_cache: RefCell::default(),
             atlas,
             path_globals_offset,
             gamma_offset,
@@ -1953,10 +2262,11 @@ impl WgpuRenderer {
 
         let surface_rgba = create_pipeline(
             "surface_rgba",
-            "vs_surface_rgba",
+            "vs_surface",
             "fs_surface_rgba",
             &layouts.globals,
-            &layouts.instances_with_texture,
+            &layouts.surfaces,
+            None,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target)],
             1,
@@ -2313,6 +2623,7 @@ impl WgpuRenderer {
     }
 
     fn record_frame(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> Result<()> {
+        self.surface_cache.borrow_mut().begin_frame();
         let queue = Arc::clone(&self.resources().queue);
         let mut instance_offset = 0;
         let instance_bindings = self
@@ -2338,22 +2649,34 @@ impl WgpuRenderer {
                 });
 
         #[cfg(target_os = "linux")]
-        let external_selection = {
+        {
             let context = self.gpu_context_handle();
             let outcome = self.external_frames.prepare_frame(context.as_ref());
             if outcome != ExternalFrameOutcome::Accepted {
                 self.last_external_frame_outcome = Some(outcome);
                 anyhow::bail!("external frame preparation failed");
             }
-            self.external_frames.selection_for_scene(scene)
-        };
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let external_selection = self.external_frames.selection_for_scene(
+            scene,
+            (self.surface_config.width, self.surface_config.height),
+        );
         #[cfg(target_os = "linux")]
         let (mut acquire_encoder, mut release_encoder) = {
-            if let Some(selection) = external_selection.filter(|slot| self.external_frames.selected_is_external(*slot)) {
+            if let Some(selection) =
+                external_selection.filter(|slot| self.external_frames.selected_is_external(*slot))
+            {
                 let mut acquire = self.resources().device.create_command_encoder(
-                    &wgpu::CommandEncoderDescriptor { label: Some("external_acquire_encoder") });
+                    &wgpu::CommandEncoderDescriptor {
+                        label: Some("external_acquire_encoder"),
+                    },
+                );
                 let release = self.resources().device.create_command_encoder(
-                    &wgpu::CommandEncoderDescriptor { label: Some("external_release_encoder") });
+                    &wgpu::CommandEncoderDescriptor {
+                        label: Some("external_release_encoder"),
+                    },
+                );
                 let outcome = self.external_frames.encode_acquire(selection, &mut acquire);
                 if outcome != ExternalFrameOutcome::Accepted {
                     self.last_external_frame_outcome = Some(outcome);
@@ -2466,7 +2789,11 @@ impl WgpuRenderer {
                         &mut pass,
                     ),
                     PrimitiveBatch::Surfaces(range) => {
-                        if !self.draw_surfaces(&scene.surfaces[range], &mut instance_offset, &mut pass) {
+                        if !self.draw_surfaces(
+                            &scene.surfaces[range],
+                            &mut instance_offset,
+                            &mut pass,
+                        ) {
                             anyhow::bail!("surface instance buffer exhausted");
                         }
                     }
@@ -2475,8 +2802,14 @@ impl WgpuRenderer {
         }
 
         let render_command_buffer = encoder.finish();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let conversion_commands = self.external_frames.take_rgba_commands(external_selection);
         #[cfg(target_os = "linux")]
-        if let (Some(selection), Some(acquire), Some(mut release)) = (external_selection, acquire_encoder.take(), release_encoder.take()) {
+        if let (Some(selection), Some(acquire), Some(mut release)) = (
+            external_selection,
+            acquire_encoder.take(),
+            release_encoder.take(),
+        ) {
             let outcome = self.external_frames.encode_release(selection, &mut release);
             if outcome != ExternalFrameOutcome::Accepted {
                 self.last_external_frame_outcome = Some(outcome);
@@ -2491,16 +2824,28 @@ impl WgpuRenderer {
             }
             queue.submit([acquire_commands, render_command_buffer, release_commands]);
         } else {
-            queue.submit(std::iter::once(render_command_buffer));
+            queue.submit(
+                conversion_commands
+                    .into_iter()
+                    .chain(std::iter::once(render_command_buffer)),
+            );
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "android")]
+        queue.submit(
+            conversion_commands
+                .into_iter()
+                .chain(std::iter::once(render_command_buffer)),
+        );
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         queue.submit(std::iter::once(render_command_buffer));
-        #[cfg(target_os = "linux")]
-        if self.external_frames
-            .commit_after_submission_with_queue(external_selection, &queue) {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if self
+            .external_frames
+            .commit_after_submission_with_queue(external_selection, &queue)
+        {
             self.last_external_frame_outcome = Some(ExternalFrameOutcome::Accepted);
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         self.external_frames.commit_after_submission();
         Ok(())
     }
@@ -2571,268 +2916,161 @@ impl WgpuRenderer {
     fn draw_surfaces(
         &self,
         surfaces: &[gpui::PaintSurface],
-        instance_offset: &mut u64,
+        _instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
-        struct RgbaDraw {
-            bind_group: wgpu::BindGroup,
-            scissor_rect: (u32, u32, u32, u32),
-            _view: wgpu::TextureView,
+        enum SurfaceTextures<'a> {
+            Rgba(&'a Arc<wgpu::Texture>),
+            Nv12 {
+                y_texture: &'a Arc<wgpu::Texture>,
+                cb_cr_texture: &'a Arc<wgpu::Texture>,
+                matrix: gpui::VideoColorMatrix,
+                range: gpui::VideoColorRange,
+                transfer: u32,
+                custom: Option<gpui::Nv12ColorTransform>,
+                multiplanar: bool,
+            },
         }
 
-        let mut rgba_draws: Vec<RgbaDraw> = Vec::new();
-        // NV12 data collected without per-surface buffers — the cached
-        // uniform buffer is reused via interleaved write-then-draw.
-        struct Nv12Data {
-            y_view: wgpu::TextureView,
-            cb_cr_view: wgpu::TextureView,
-            params_data: Vec<u8>,
-            scissor_rect: (u32, u32, u32, u32),
-        }
-        let mut nv12_items: Vec<Nv12Data> = Vec::new();
-
+        let resources = self.resources();
+        let mut cache = self.surface_cache.borrow_mut();
         for surface in surfaces {
-            // Skip zero-sized surfaces (collapsed panels, hidden elements).
             if surface.bounds.size.width.0 <= 0.0 || surface.bounds.size.height.0 <= 0.0 {
                 continue;
             }
-
-            let resources = self.resources();
-
-            match &surface.content {
-                gpui::SurfaceContent::WgpuTexture(texture) => {
-                    let instance = SurfaceInstance {
-                        bounds: surface.bounds.into(),
-                        content_mask: surface.content_mask.bounds.into(),
-                    };
-                    let data = unsafe {
-                        std::slice::from_raw_parts(
-                            &instance as *const SurfaceInstance as *const u8,
-                            std::mem::size_of::<SurfaceInstance>(),
-                        )
-                    };
-                    let Some((offset, size)) = self.write_to_instance_buffer(instance_offset, data)
-                    else {
-                        return false;
-                    };
-
-                    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-                    let bind_group =
-                        resources
-                            .device
-                            .create_bind_group(&wgpu::BindGroupDescriptor {
-                                label: Some("surface_rgba_bind_group"),
-                                layout: &resources.bind_group_layouts.instances_with_texture,
-                                entries: &[
-                                    wgpu::BindGroupEntry {
-                                        binding: 0,
-                                        resource: self.instance_binding(offset, size),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 1,
-                                        resource: wgpu::BindingResource::TextureView(&view),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 2,
-                                        resource: wgpu::BindingResource::Sampler(
-                                            &resources.atlas_sampler,
-                                        ),
-                                    },
-                                ],
-                            });
-
-                    let scissor_rect = (
-                        surface.content_mask.bounds.origin.x.0.max(0.0) as u32,
-                        surface.content_mask.bounds.origin.y.0.max(0.0) as u32,
-                        surface.content_mask.bounds.size.width.0.max(0.0) as u32,
-                        surface.content_mask.bounds.size.height.0.max(0.0) as u32,
-                    );
-
-                    rgba_draws.push(RgbaDraw {
-                        bind_group,
-                        scissor_rect,
-                        _view: view,
-                    });
-                    // write_to_instance_buffer already advanced instance_offset
-                    // to the next aligned position; do not add extra offset here.
-                }
-                gpui::SurfaceContent::WgpuTextureNv12 { .. }
-                | gpui::SurfaceContent::WgpuTextureNv12WithColorTransform { .. } => {
-                    let (y_texture, cb_cr_texture, color_transform) = match &surface.content {
-                        gpui::SurfaceContent::WgpuTextureNv12 {
-                            y_texture,
-                            cb_cr_texture,
-                            ..
-                        } => (
-                            y_texture,
-                            cb_cr_texture,
-                            gpui::Nv12ColorTransform::default(),
-                        ),
-                        gpui::SurfaceContent::WgpuTextureNv12WithColorTransform {
-                            y_texture,
-                            cb_cr_texture,
-                            color_transform,
-                            ..
-                        } => (y_texture, cb_cr_texture, *color_transform),
-                        #[allow(unreachable_patterns)]
-                        _ => continue,
-                    };
-                    let params = SurfaceParams::new(
-                        surface.bounds.into(),
-                        surface.content_mask.bounds.into(),
-                        color_transform,
-                    );
-                    let params_data = unsafe {
-                        std::slice::from_raw_parts(
-                            &params as *const SurfaceParams as *const u8,
-                            std::mem::size_of::<SurfaceParams>(),
-                        )
-                    };
-
-                    let y_view = y_texture.create_view(&wgpu::TextureViewDescriptor::default());
-                    let cb_cr_view =
-                        cb_cr_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-                    nv12_items.push(Nv12Data {
-                        y_view,
-                        cb_cr_view,
-                        params_data: params_data.to_vec(),
-                        scissor_rect: (
-                            surface.content_mask.bounds.origin.x.0.max(0.0) as u32,
-                            surface.content_mask.bounds.origin.y.0.max(0.0) as u32,
-                            surface.content_mask.bounds.size.width.0.max(0.0) as u32,
-                            surface.content_mask.bounds.size.height.0.max(0.0) as u32,
-                        ),
-                    });
-                }
+            let Some(scissor_rect) = clamp_surface_scissor(
+                surface.content_mask.bounds,
+                self.surface_config.width,
+                self.surface_config.height,
+            ) else {
+                continue;
+            };
+            let textures = match &surface.content {
+                gpui::SurfaceContent::WgpuRgba(source) => SurfaceTextures::Rgba(source.texture()),
+                gpui::SurfaceContent::WgpuNv12(source) => SurfaceTextures::Nv12 {
+                    y_texture: source.y_texture(),
+                    cb_cr_texture: source.cb_cr_texture(),
+                    matrix: source.matrix(),
+                    range: source.range(),
+                    transfer: video_transfer_kind(source.transfer()),
+                    custom: None,
+                    multiplanar: false,
+                },
+                gpui::SurfaceContent::WgpuTextureNv12 {
+                    y_texture,
+                    cb_cr_texture,
+                    ..
+                } => SurfaceTextures::Nv12 {
+                    y_texture,
+                    cb_cr_texture,
+                    matrix: gpui::VideoColorMatrix::Bt601,
+                    range: gpui::VideoColorRange::Full,
+                    transfer: 0,
+                    custom: Some(gpui::Nv12ColorTransform::default()),
+                    multiplanar: false,
+                },
+                gpui::SurfaceContent::WgpuTextureNv12WithColorTransform {
+                    y_texture,
+                    cb_cr_texture,
+                    color_transform,
+                    ..
+                } => SurfaceTextures::Nv12 {
+                    y_texture,
+                    cb_cr_texture,
+                    matrix: gpui::VideoColorMatrix::Bt601,
+                    range: gpui::VideoColorRange::Full,
+                    transfer: 0,
+                    custom: Some(*color_transform),
+                    multiplanar: false,
+                },
                 gpui::SurfaceContent::WgpuTextureNv12Multiplanar {
                     texture,
                     color_transform,
                     ..
-                } => {
-                    let params = SurfaceParams::new(
-                        surface.bounds.into(),
-                        surface.content_mask.bounds.into(),
-                        *color_transform,
-                    );
-                    let params_data = unsafe {
-                        std::slice::from_raw_parts(
-                            &params as *const SurfaceParams as *const u8,
-                            std::mem::size_of::<SurfaceParams>(),
-                        )
-                    };
-                    let Some(plane0_descriptor) =
-                        nv12_plane_view_descriptor(wgpu::TextureAspect::Plane0)
-                    else {
-                        return false;
-                    };
-                    let Some(plane1_descriptor) =
-                        nv12_plane_view_descriptor(wgpu::TextureAspect::Plane1)
-                    else {
-                        return false;
-                    };
-                    let y_view = texture.create_view(&plane0_descriptor);
-                    let cb_cr_view = texture.create_view(&plane1_descriptor);
-                    nv12_items.push(Nv12Data {
-                        y_view,
-                        cb_cr_view,
-                        params_data: params_data.to_vec(),
-                        scissor_rect: (
-                            surface.content_mask.bounds.origin.x.0.max(0.0) as u32,
-                            surface.content_mask.bounds.origin.y.0.max(0.0) as u32,
-                            surface.content_mask.bounds.size.width.0.max(0.0) as u32,
-                            surface.content_mask.bounds.size.height.0.max(0.0) as u32,
-                        ),
-                    });
-                }
+                } => SurfaceTextures::Nv12 {
+                    y_texture: texture,
+                    cb_cr_texture: texture,
+                    matrix: gpui::VideoColorMatrix::Bt601,
+                    range: gpui::VideoColorRange::Full,
+                    transfer: 0,
+                    custom: Some(*color_transform),
+                    multiplanar: true,
+                },
                 #[allow(unreachable_patterns)]
                 _ => continue,
-            }
-        }
+            };
 
-        let resources = self.resources();
-
-        // Draw RGBA surfaces with the passthrough pipeline.
-        for draw in &rgba_draws {
-            pass.set_pipeline(&resources.pipelines.surface_rgba);
-            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
-            pass.set_bind_group(1, &draw.bind_group, &[]);
-            pass.set_scissor_rect(
-                draw.scissor_rect.0,
-                draw.scissor_rect.1,
-                draw.scissor_rect.2,
-                draw.scissor_rect.3,
-            );
-            pass.draw(0..4, 0..1);
-        }
-
-        // Draw NV12 surfaces with the YUV→RGB conversion pipeline.
-        // Each surface uses its own uniform buffer (created here,
-        // not cached) so bind-group lifetimes are correct and
-        // buffer offsets are naturally aligned.
-        struct Nv12Draw {
-            bind_group: wgpu::BindGroup,
-            _uniform_buffer: wgpu::Buffer,
-            scissor_rect: (u32, u32, u32, u32),
-        }
-        let mut nv12_draws: Vec<Nv12Draw> = Vec::with_capacity(nv12_items.len());
-
-        for item in nv12_items {
-            let uniform_buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("surface_nv12_uniform"),
-                size: std::mem::size_of::<SurfaceParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            let (pipeline, y, uv, multiplanar, ycbcr_to_rgb, transfer) = match textures {
+                SurfaceTextures::Rgba(texture) => (
+                    &resources.pipelines.surface_rgba,
+                    texture,
+                    texture,
+                    false,
+                    [[0.0; 4]; 4],
+                    0,
+                ),
+                SurfaceTextures::Nv12 {
+                    y_texture,
+                    cb_cr_texture,
+                    matrix,
+                    range,
+                    transfer,
+                    custom,
+                    multiplanar,
+                } => (
+                    &resources.pipelines.surfaces,
+                    y_texture,
+                    cb_cr_texture,
+                    multiplanar,
+                    custom
+                        .map(|value| value.yuv_to_rgb)
+                        .unwrap_or_else(|| ycbcr_to_rgb_matrix(matrix, range)),
+                    transfer,
+                ),
+            };
+            let params = SurfaceParams {
+                transfer,
+                ..SurfaceParams::new(
+                    surface.bounds.into(),
+                    surface.content_mask.bounds.into(),
+                    gpui::Nv12ColorTransform {
+                        yuv_to_rgb: ycbcr_to_rgb,
+                    },
+                )
+            };
+            // One slot per draw across ALL batches in this frame: reusing a slot
+            // within a frame would overwrite uniforms before queue submission.
+            let index = cache.used;
+            cache.used = cache.used.saturating_add(1);
+            let temporary;
+            let slot = if index < SURFACE_CACHE_LIMIT {
+                if index == cache.slots.len() {
+                    cache
+                        .slots
+                        .push(SurfaceSlot::new(resources, y, uv, multiplanar));
+                }
+                let slot = &mut cache.slots[index];
+                slot.update_textures(resources, y, uv, multiplanar);
+                slot
+            } else {
+                temporary = SurfaceSlot::new(resources, y, uv, multiplanar);
+                &temporary
+            };
             resources
                 .queue
-                .write_buffer(&uniform_buffer, 0, &item.params_data);
-
-            let bind_group = resources
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("surface_nv12_bind_group"),
-                    layout: &resources.bind_group_layouts.surfaces,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: uniform_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(&item.y_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::TextureView(&item.cb_cr_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
-                        },
-                    ],
-                });
-
-            nv12_draws.push(Nv12Draw {
-                bind_group,
-                _uniform_buffer: uniform_buffer,
-                scissor_rect: item.scissor_rect,
-            });
-        }
-
-        for draw in &nv12_draws {
-            pass.set_pipeline(&resources.pipelines.surfaces);
+                .write_buffer(&slot.uniform, 0, bytemuck::bytes_of(&params));
+            pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &resources.globals_bind_group, &[]);
-            pass.set_bind_group(1, &draw.bind_group, &[]);
+            pass.set_bind_group(1, &slot.binding, &[]);
             pass.set_scissor_rect(
-                draw.scissor_rect.0,
-                draw.scissor_rect.1,
-                draw.scissor_rect.2,
-                draw.scissor_rect.3,
+                scissor_rect.0,
+                scissor_rect.1,
+                scissor_rect.2,
+                scissor_rect.3,
             );
             pass.draw(0..4, 0..1);
         }
-
+        pass.set_scissor_rect(0, 0, self.surface_config.width, self.surface_config.height);
         true
     }
 
@@ -3275,6 +3513,7 @@ impl WgpuRenderer {
     pub fn destroy(&mut self) {
         // Release surface-bound GPU resources eagerly so the underlying native
         // window can be destroyed before the renderer itself is dropped.
+        self.surface_cache.get_mut().slots.clear();
         self.resources.take();
     }
 
@@ -3446,6 +3685,121 @@ mod external_frame_tests {
         assert_eq!(plane1.aspect, wgpu::TextureAspect::Plane1);
         assert_eq!(plane1.format, Some(wgpu::TextureFormat::Rg8Unorm));
         assert!(super::nv12_plane_view_descriptor(wgpu::TextureAspect::All).is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn prepared_rgba_commands_wait_for_visible_selection_and_submit_once() -> anyhow::Result<()> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: None,
+        });
+        let adapter =
+            match gpui::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+            {
+                Ok(adapter) => adapter,
+                Err(error) => {
+                    eprintln!("SKIP prepared RGBA integration: no Vulkan adapter: {error}");
+                    return Ok(());
+                }
+            };
+        eprintln!(
+            "Prepared RGBA integration adapter: {:?}",
+            adapter.get_info()
+        );
+        let (device, queue) =
+            gpui::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?;
+        let texture = std::sync::Arc::new(device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("prepared RGBA test"),
+            size: wgpu::Extent3d {
+                width: 2,
+                height: 2,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        }));
+        let view = texture.create_view(&Default::default());
+        let mut encoder = device.create_command_encoder(&Default::default());
+        drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        }));
+        // SAFETY: both resources belong to device; the tracked render pass writes
+        // this texture and wgpu retains its resources through GPU completion.
+        let frame = unsafe { gpui::ExternalRgbaFrame::new(texture, encoder.finish()) }?;
+        let (texture, commands) = frame.into_parts();
+        let mut state = ExternalFrameState::default();
+        state.latest = Some(super::PendingExternalFrame::Rgba {
+            texture: texture.clone(),
+            commands: Some(commands),
+        });
+        let bounds = gpui::Bounds {
+            origin: gpui::point(gpui::ScaledPixels(0.0), gpui::ScaledPixels(0.0)),
+            size: gpui::size(gpui::ScaledPixels(2.0), gpui::ScaledPixels(2.0)),
+        };
+        let mut scene = gpui::Scene::default();
+        scene.surfaces.push(gpui::PaintSurface {
+            order: 0,
+            bounds,
+            content_mask: gpui::ContentMask { bounds },
+            content: gpui::SurfaceContent::WgpuRgba(gpui::RgbaTextureSource::new(
+                texture,
+                gpui::size(gpui::DevicePixels(2), gpui::DevicePixels(2)),
+                gpui::GpuTextureAlphaMode::Opaque,
+                gpui::GpuTextureColorSpace::Srgb,
+            )?),
+        });
+        // A clipped frame and a collapsed frame must retain the one-shot work.
+        assert_eq!(state.selection_for_scene(&scene, (0, 0)), None);
+        assert!(state.take_rgba_commands(None).is_none());
+        assert!(matches!(
+            state.latest(),
+            Some(super::PendingExternalFrame::Rgba {
+                commands: Some(_),
+                ..
+            })
+        ));
+        scene.surfaces[0].bounds.size.width.0 = 0.0;
+        assert_eq!(state.selection_for_scene(&scene, (2, 2)), None);
+        scene.surfaces[0].bounds.size.width.0 = 2.0;
+        let selection = state.selection_for_scene(&scene, (2, 2));
+        assert_eq!(selection, Some(super::ExternalFrameSlot::Latest));
+        assert!(state.displayed().is_none());
+        queue.submit(state.take_rgba_commands(selection));
+        assert!(state.commit_after_submission_with_queue(selection, &queue));
+        let selection = state.selection_for_scene(&scene, (2, 2));
+        assert_eq!(selection, Some(super::ExternalFrameSlot::Displayed));
+        assert!(state.take_rgba_commands(selection).is_none());
+        assert!(!state.commit_after_submission_with_queue(selection, &queue));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sync_file_validation_rejects_regular_descriptors_without_gpu_calls() -> anyhow::Result<()> {
+        let invalid = std::fs::File::open("/dev/null")?;
+        assert_eq!(
+            super::validate_sync_file(&invalid.into()),
+            Err(ash::vk::Result::ERROR_INVALID_EXTERNAL_HANDLE)
+        );
+        assert_eq!(std::mem::size_of::<super::SyncFileInfo>(), 56);
+        Ok(())
     }
 
     #[test]
@@ -4471,14 +4825,11 @@ mod tests {
     }
 
     #[test]
-    fn nv12_tuple_apis_are_available_without_gpu_resources() {
+    fn validated_surface_sources_and_custom_nv12_api_are_available() {
         fn assert_into_surface_source<T: Into<gpui::SurfaceSource>>() {}
 
-        assert_into_surface_source::<(
-            Arc<wgpu::Texture>,
-            Arc<wgpu::Texture>,
-            gpui::Size<gpui::DevicePixels>,
-        )>();
+        assert_into_surface_source::<gpui::RgbaTextureSource>();
+        assert_into_surface_source::<gpui::Nv12TextureSource>();
         assert_into_surface_source::<(
             Arc<wgpu::Texture>,
             Arc<wgpu::Texture>,
@@ -4519,13 +4870,246 @@ mod tests {
             transform,
         );
 
-        assert_eq!(params.yuv_to_rgb, transform.yuv_to_rgb);
+        assert_eq!(params.ycbcr_to_rgb, transform.yuv_to_rgb);
         assert_eq!(
             bytemuck::bytes_of(&params).get(32..96),
             Some(bytemuck::bytes_of(&transform.yuv_to_rgb))
         );
-        assert!(
-            include_str!("shaders.wgsl").contains("return surface_locals.yuv_to_rgb * y_cb_cr;")
+        assert_eq!(params.transfer, 0);
+        assert!(include_str!("shaders.wgsl").contains("surface_locals.ycbcr_to_rgb * y_cb_cr"));
+    }
+}
+
+#[cfg(test)]
+mod normalized_surface_tests {
+    use super::*;
+
+    fn apply_color_matrix(matrix: [[f32; 4]; 4], y: f32, cb: f32, cr: f32) -> [f32; 3] {
+        [
+            matrix[0][0] * y + matrix[1][0] * cb + matrix[2][0] * cr + matrix[3][0],
+            matrix[0][1] * y + matrix[1][1] * cb + matrix[2][1] * cr + matrix[3][1],
+            matrix[0][2] * y + matrix[1][2] * cb + matrix[2][2] * cr + matrix[3][2],
+        ]
+    }
+
+    fn assert_rgb_close(actual: [f32; 3], expected: [f32; 3]) {
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() < 0.02,
+                "expected {expected}, got {actual}"
+            );
+        }
+    }
+
+    fn scaled_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: Point {
+                x: ScaledPixels(x),
+                y: ScaledPixels(y),
+            },
+            size: Size {
+                width: ScaledPixels(width),
+                height: ScaledPixels(height),
+            },
+        }
+    }
+
+    #[test]
+    fn surface_scissor_clamps_negative_origin() {
+        assert_eq!(
+            clamp_surface_scissor(scaled_bounds(-10.0, -20.0, 30.0, 50.0), 100, 100),
+            Some((0, 0, 20, 30))
         );
+    }
+
+    #[test]
+    fn surface_scissor_clamps_to_render_target() {
+        assert_eq!(
+            clamp_surface_scissor(scaled_bounds(80.0, 70.0, 40.0, 50.0), 100, 100),
+            Some((80, 70, 20, 30))
+        );
+    }
+
+    #[test]
+    fn surface_scissor_skips_empty_intersection() {
+        assert_eq!(
+            clamp_surface_scissor(scaled_bounds(-40.0, 10.0, 20.0, 20.0), 100, 100),
+            None
+        );
+        assert_eq!(
+            clamp_surface_scissor(scaled_bounds(10.0, 110.0, 20.0, 20.0), 100, 100),
+            None
+        );
+    }
+
+    #[test]
+    fn limited_range_color_matrices_map_reference_black_and_white() {
+        for matrix in [
+            gpui::VideoColorMatrix::Bt601,
+            gpui::VideoColorMatrix::Bt709,
+            gpui::VideoColorMatrix::Bt2020,
+        ] {
+            let conversion = ycbcr_to_rgb_matrix(matrix, gpui::VideoColorRange::Limited);
+            assert_rgb_close(
+                apply_color_matrix(conversion, 16.0 / 255.0, 0.5, 0.5),
+                [0.0; 3],
+            );
+            assert_rgb_close(
+                apply_color_matrix(conversion, 235.0 / 255.0, 0.5, 0.5),
+                [1.0; 3],
+            );
+        }
+    }
+
+    #[test]
+    fn bt601_limited_matrix_maps_reference_red() {
+        let conversion = ycbcr_to_rgb_matrix(
+            gpui::VideoColorMatrix::Bt601,
+            gpui::VideoColorRange::Limited,
+        );
+        assert_rgb_close(
+            apply_color_matrix(conversion, 81.0 / 255.0, 90.0 / 255.0, 240.0 / 255.0),
+            [1.0, 0.0, 0.0],
+        );
+    }
+}
+
+#[cfg(test)]
+mod video_color_tests {
+    use super::*;
+    fn apply_color_matrix(matrix: [[f32; 4]; 4], y: f32, cb: f32, cr: f32) -> [f32; 3] {
+        [
+            matrix[0][0] * y + matrix[1][0] * cb + matrix[2][0] * cr + matrix[3][0],
+            matrix[0][1] * y + matrix[1][1] * cb + matrix[2][1] * cr + matrix[3][1],
+            matrix[0][2] * y + matrix[1][2] * cb + matrix[2][2] * cr + matrix[3][2],
+        ]
+    }
+
+    fn assert_rgb_close(actual: [f32; 3], expected: [f32; 3]) {
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() < 0.002,
+                "expected {expected}, got {actual}"
+            );
+        }
+    }
+
+    fn reference_transfer_to_srgb(transfer: gpui::VideoTransferFunction, encoded: f32) -> f32 {
+        let encoded = encoded.clamp(0.0, 1.0);
+        if transfer == gpui::VideoTransferFunction::Srgb {
+            return encoded;
+        }
+        let (alpha, beta) = match transfer {
+            gpui::VideoTransferFunction::Bt709 => (1.099_f32, 0.018_f32),
+            gpui::VideoTransferFunction::Bt2020Ten => (1.0993_f32, 0.0181_f32),
+            gpui::VideoTransferFunction::Srgb => unreachable!(),
+        };
+        let linear = if encoded < 4.5 * beta {
+            encoded / 4.5
+        } else {
+            ((encoded + alpha - 1.0) / alpha).powf(1.0 / 0.45)
+        };
+        if linear <= 0.003_130_8 {
+            12.92 * linear
+        } else {
+            1.055 * linear.powf(1.0 / 2.4) - 0.055
+        }
+    }
+
+    fn reference_ycbcr_to_rgb(
+        matrix: gpui::VideoColorMatrix,
+        range: gpui::VideoColorRange,
+        y: f32,
+        cb: f32,
+        cr: f32,
+    ) -> [f32; 3] {
+        let (kr, kb) = match matrix {
+            gpui::VideoColorMatrix::Bt601 => (0.299, 0.114),
+            gpui::VideoColorMatrix::Bt709 => (0.2126, 0.0722),
+            gpui::VideoColorMatrix::Bt2020 => (0.2627, 0.0593),
+        };
+        let kg = 1.0 - kr - kb;
+        let (y, cb, cr) = match range {
+            gpui::VideoColorRange::Full => (y, cb - 0.5, cr - 0.5),
+            gpui::VideoColorRange::Limited => (
+                (y - 16.0 / 255.0) * 255.0 / 219.0,
+                (cb - 0.5) * 255.0 / 224.0,
+                (cr - 0.5) * 255.0 / 224.0,
+            ),
+        };
+        let r_cr = 2.0 * (1.0 - kr);
+        let b_cb = 2.0 * (1.0 - kb);
+        let g_cb = -kb * b_cb / kg;
+        let g_cr = -kr * r_cr / kg;
+        [y + r_cr * cr, y + g_cb * cb + g_cr * cr, y + b_cb * cb]
+    }
+
+    #[test]
+    fn all_color_matrices_and_ranges_match_reference_equations() {
+        for matrix in [
+            gpui::VideoColorMatrix::Bt601,
+            gpui::VideoColorMatrix::Bt709,
+            gpui::VideoColorMatrix::Bt2020,
+        ] {
+            for range in [gpui::VideoColorRange::Full, gpui::VideoColorRange::Limited] {
+                let conversion = ycbcr_to_rgb_matrix(matrix, range);
+                for [y, cb, cr] in [[0.25, 0.35, 0.75], [0.50, 0.50, 0.50], [0.80, 0.65, 0.30]] {
+                    assert_rgb_close(
+                        apply_color_matrix(conversion, y, cb, cr),
+                        reference_ycbcr_to_rgb(matrix, range, y, cb, cr),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_range_color_matrices_map_reference_black_and_white() {
+        for matrix in [
+            gpui::VideoColorMatrix::Bt601,
+            gpui::VideoColorMatrix::Bt709,
+            gpui::VideoColorMatrix::Bt2020,
+        ] {
+            let conversion = ycbcr_to_rgb_matrix(matrix, gpui::VideoColorRange::Full);
+            assert_rgb_close(apply_color_matrix(conversion, 0.0, 0.5, 0.5), [0.0; 3]);
+            assert_rgb_close(apply_color_matrix(conversion, 1.0, 0.5, 0.5), [1.0; 3]);
+        }
+    }
+
+    #[test]
+    fn surface_transfer_uniform_matches_shader_contract() {
+        assert_eq!(video_transfer_kind(gpui::VideoTransferFunction::Srgb), 0);
+        assert_eq!(video_transfer_kind(gpui::VideoTransferFunction::Bt709), 1);
+        assert_eq!(
+            video_transfer_kind(gpui::VideoTransferFunction::Bt2020Ten),
+            2
+        );
+        assert_eq!(std::mem::size_of::<SurfaceParams>(), 112);
+    }
+
+    #[test]
+    fn video_transfer_functions_convert_reference_values_to_srgb() {
+        assert_eq!(
+            reference_transfer_to_srgb(gpui::VideoTransferFunction::Srgb, 0.5),
+            0.5
+        );
+        assert!(
+            (reference_transfer_to_srgb(gpui::VideoTransferFunction::Bt709, 0.5) - 0.546_458_07)
+                .abs()
+                < 0.000_001
+        );
+        assert!(
+            (reference_transfer_to_srgb(gpui::VideoTransferFunction::Bt2020Ten, 0.5) - 0.546_584_9)
+                .abs()
+                < 0.000_001
+        );
+        for transfer in [
+            gpui::VideoTransferFunction::Srgb,
+            gpui::VideoTransferFunction::Bt709,
+            gpui::VideoTransferFunction::Bt2020Ten,
+        ] {
+            assert_eq!(reference_transfer_to_srgb(transfer, 0.0), 0.0);
+            assert!((reference_transfer_to_srgb(transfer, 1.0) - 1.0).abs() < 0.000_001);
+        }
     }
 }

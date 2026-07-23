@@ -1,7 +1,9 @@
+#[cfg(feature = "wgpu")]
+use crate::{DevicePixels, Size};
 use crate::{
-    Bounds, DevicePixels, Element, ElementId, GlobalElementId, InspectorElementId,
-    InteractiveElement, Interactivity, IntoElement, LayoutId, ObjectFit, Pixels, Size, Style,
-    StyleRefinement, Styled, Window,
+    Bounds, Element, ElementId, GlobalElementId, InspectorElementId, InteractiveElement,
+    Interactivity, IntoElement, LayoutId, ObjectFit, Pixels, Style, StyleRefinement, Styled,
+    Window,
 };
 #[cfg(target_os = "macos")]
 use core_video::pixel_buffer::CVPixelBuffer;
@@ -42,20 +44,17 @@ pub enum SurfaceSource {
     /// A macOS CoreVideo pixel buffer (zero-copy, no pre-registration needed).
     #[cfg(target_os = "macos")]
     Surface(CVPixelBuffer),
-    /// A wgpu texture with its descriptor for [`ObjectFit`] sizing.
+    /// A validated RGBA/BGRA texture with explicit alpha and color metadata.
     #[cfg(feature = "wgpu")]
-    Texture {
-        texture: Arc<wgpu::Texture>,
-        /// The texture's native size in device pixels, used for
-        /// [`ObjectFit`] calculations. When `None`, the texture
-        /// fills the layout bounds (ignoring aspect ratio).
-        native_size: Option<Size<DevicePixels>>,
-    },
-    /// Two-plane NV12 wgpu texture (Y plane R8Unorm + CbCr plane Rg8Unorm).
+    Rgba(crate::RgbaTextureSource),
+    /// Validated NV12 planes with explicit color-conversion metadata.
     #[cfg(feature = "wgpu")]
     Nv12Texture {
+        /// Luma plane.
         y_texture: Arc<wgpu::Texture>,
+        /// Interleaved chroma plane.
         cb_cr_texture: Arc<wgpu::Texture>,
+        /// Source dimensions for object-fit.
         native_size: Size<DevicePixels>,
     },
     /// Two-plane NV12 wgpu texture with an explicit color transform.
@@ -75,6 +74,9 @@ pub enum SurfaceSource {
         native_size: Size<DevicePixels>,
         color_transform: Nv12ColorTransform,
     },
+    /// Validated NV12 planes with explicit color metadata.
+    #[cfg(feature = "wgpu")]
+    Nv12(crate::Nv12TextureSource),
 }
 
 #[cfg(target_os = "macos")]
@@ -85,49 +87,16 @@ impl From<CVPixelBuffer> for SurfaceSource {
 }
 
 #[cfg(feature = "wgpu")]
-impl From<Arc<wgpu::Texture>> for SurfaceSource {
-    fn from(texture: Arc<wgpu::Texture>) -> Self {
-        SurfaceSource::Texture {
-            texture,
-            native_size: None,
-        }
+impl From<crate::RgbaTextureSource> for SurfaceSource {
+    fn from(source: crate::RgbaTextureSource) -> Self {
+        Self::Rgba(source)
     }
 }
 
 #[cfg(feature = "wgpu")]
-impl From<(Arc<wgpu::Texture>, crate::GpuTextureDescriptor)> for SurfaceSource {
-    fn from((texture, descriptor): (Arc<wgpu::Texture>, crate::GpuTextureDescriptor)) -> Self {
-        SurfaceSource::Texture {
-            texture,
-            native_size: Some(descriptor.size),
-        }
-    }
-}
-
-#[cfg(feature = "wgpu")]
-impl From<(Arc<wgpu::Texture>, Option<Size<DevicePixels>>)> for SurfaceSource {
-    fn from((texture, native_size): (Arc<wgpu::Texture>, Option<Size<DevicePixels>>)) -> Self {
-        SurfaceSource::Texture {
-            texture,
-            native_size,
-        }
-    }
-}
-
-#[cfg(feature = "wgpu")]
-impl From<(Arc<wgpu::Texture>, Arc<wgpu::Texture>, Size<DevicePixels>)> for SurfaceSource {
-    fn from(
-        (y_texture, cb_cr_texture, native_size): (
-            Arc<wgpu::Texture>,
-            Arc<wgpu::Texture>,
-            Size<DevicePixels>,
-        ),
-    ) -> Self {
-        SurfaceSource::Nv12Texture {
-            y_texture,
-            cb_cr_texture,
-            native_size,
-        }
+impl From<crate::Nv12TextureSource> for SurfaceSource {
+    fn from(source: crate::Nv12TextureSource) -> Self {
+        Self::Nv12(source)
     }
 }
 
@@ -179,17 +148,14 @@ impl From<(Arc<wgpu::Texture>, Size<DevicePixels>, Nv12ColorTransform)> for Surf
 /// # Examples
 ///
 /// ```ignore
-/// // wgpu texture with object-fit (cross-platform):
-/// surface((video_frame_texture, descriptor)).object_fit(ObjectFit::Contain)
+/// // Validated wgpu texture source with object-fit (cross-platform):
+/// surface(rgba_source).object_fit(ObjectFit::Contain)
 ///
 /// // macOS zero-copy via CoreVideo pixel buffer (Metal backend):
 /// surface(pixel_buffer).object_fit(ObjectFit::Contain)
 ///
-/// // Without object-fit (fills bounds):
-/// surface(video_frame_texture)
-///
 /// // 3D viewport with mouse input:
-/// surface((render_target, descriptor))
+/// surface(rgba_source)
 ///     .object_fit(ObjectFit::Fill)
 ///     .on_scroll(cx.listener(|this, event, window, cx| { ... }))
 /// ```
@@ -257,10 +223,8 @@ impl Element for Surface {
                 }
             }
             #[cfg(feature = "wgpu")]
-            SurfaceSource::Texture {
-                native_size: Some(size),
-                ..
-            } => {
+            SurfaceSource::Rgba(source) => {
+                let size = source.native_size();
                 if size.height.0 > 0 {
                     style.aspect_ratio = Some(size.width.0 as f32 / size.height.0 as f32);
                     true
@@ -280,6 +244,17 @@ impl Element for Surface {
                     false
                 }
             }
+            #[cfg(feature = "wgpu")]
+            SurfaceSource::Nv12(source) => {
+                let size = source.native_size();
+                if size.height.0 > 0 {
+                    style.aspect_ratio = Some(size.width.0 as f32 / size.height.0 as f32);
+                    true
+                } else {
+                    false
+                }
+            }
+            #[allow(unreachable_patterns)]
             _ => false,
         };
 
@@ -341,47 +316,16 @@ impl Element for Surface {
                         let paint_bounds = self.object_fit.get_bounds(bounds, device_size);
                         window.paint_surface(paint_bounds, pixel_buffer.clone());
                     }
-                    // Cross-platform wgpu texture path.
                     #[cfg(feature = "wgpu")]
-                    SurfaceSource::Texture {
-                        texture,
-                        native_size: Some(size),
-                    } => {
-                        let paint_bounds = self.object_fit.get_bounds(bounds, *size);
-                        eprintln!(
-                            "RGBA paint: layout_bounds={:?}×{:?}, native={:?}×{:?}, paint_bounds={:?}×{:?}",
-                            bounds.origin, bounds.size,
-                            size.width, size.height,
-                            paint_bounds.origin, paint_bounds.size,
-                        );
-                        window.paint_surface_with_texture(paint_bounds, texture.clone());
+                    SurfaceSource::Rgba(source) => {
+                        let paint_bounds = self.object_fit.get_bounds(bounds, source.native_size());
+                        window.paint_surface_with_rgba_source(paint_bounds, source.clone());
                     }
                     #[cfg(feature = "wgpu")]
-                    SurfaceSource::Texture {
-                        texture,
-                        native_size: None,
-                    } => {
-                        window.paint_surface_with_texture(bounds, texture.clone());
-                    }
                     #[cfg(feature = "wgpu")]
-                    SurfaceSource::Nv12Texture {
-                        y_texture,
-                        cb_cr_texture,
-                        native_size,
-                    } => {
-                        let paint_bounds = self.object_fit.get_bounds(bounds, *native_size);
-                        eprintln!(
-                            "NV12 paint: layout_bounds={:?}×{:?}, native={:?}×{:?}, paint_bounds={:?}×{:?}",
-                            bounds.origin, bounds.size,
-                            native_size.width, native_size.height,
-                            paint_bounds.origin, paint_bounds.size,
-                        );
-                        window.paint_surface_with_nv12_texture(
-                            paint_bounds,
-                            y_texture.clone(),
-                            cb_cr_texture.clone(),
-                            *native_size,
-                        );
+            SurfaceSource::Nv12(source) => {
+                        let paint_bounds = self.object_fit.get_bounds(bounds, source.native_size());
+                        window.paint_surface_with_nv12_source(paint_bounds, source.clone());
                     }
                     #[cfg(feature = "wgpu")]
                     SurfaceSource::Nv12TextureWithColorTransform {

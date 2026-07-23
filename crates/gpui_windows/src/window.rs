@@ -1121,17 +1121,10 @@ impl PlatformWindow for WindowsWindow {
     }
 
     #[cfg(feature = "wgpu-renderer")]
-    fn gpu_context(&self) -> Option<GpuContextHandle> {
+    fn gpu_context(&self) -> Option<gpui::WgpuContextHandle> {
         let gpu_ctx = self.state.gpu_context.borrow();
         let wgpu = gpu_ctx.as_ref()?;
-        Some(GpuContextHandle {
-            device: wgpu.device.clone(),
-            queue: wgpu.queue.clone(),
-            instance: wgpu.instance.clone(),
-            adapter: wgpu.adapter.clone(),
-            color_texture_format: wgpu.color_texture_format(),
-            supports_dual_source_blending: wgpu.supports_dual_source_blending(),
-        })
+        wgpu.handle().ok()
     }
 
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {

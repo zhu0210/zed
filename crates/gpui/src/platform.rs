@@ -346,7 +346,7 @@ pub trait Platform: 'static {
     /// Returns `None` when the platform uses a non-wgpu backend or before
     /// any GPU resources have been initialized.
     #[cfg(feature = "wgpu")]
-    fn gpu_context(&self) -> Option<GpuContextHandle> {
+    fn gpu_context(&self) -> Option<WgpuContextHandle> {
         None
     }
 
@@ -355,83 +355,11 @@ pub trait Platform: 'static {
     /// Must be called **before** opening any windows. After the first window
     /// opens, the GPU context is frozen and this method will return an error.
     ///
-    /// Use [`GpuContextHandle`] to bundle the device, instance, adapter, and
+    /// Use [`WgpuContextDescriptor`] to bundle the device, instance, adapter, and
     /// queue together.
     #[cfg(feature = "wgpu")]
-    fn set_gpu_context(&self, _handle: GpuContextHandle) -> anyhow::Result<()> {
+    fn set_gpu_context(&self, _descriptor: WgpuContextDescriptor) -> anyhow::Result<()> {
         anyhow::bail!("set_gpu_context is not supported on this platform")
-    }
-
-    /// Inject a pre-existing wgpu device and queue for GPUI to use.
-    ///
-    /// Convenience wrapper around [`Platform::set_gpu_context()`] that
-    /// creates the [`wgpu::Instance`] and enumerates adapters automatically.
-    ///
-    /// Must be called **before** opening any windows.
-    #[cfg(feature = "wgpu")]
-    fn set_gpu_device(
-        &self,
-        device: std::sync::Arc<wgpu::Device>,
-        queue: std::sync::Arc<wgpu::Queue>,
-    ) -> anyhow::Result<()> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
-            flags: wgpu::InstanceFlags::default(),
-            backend_options: wgpu::BackendOptions::default(),
-            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-            display: None,
-        });
-
-        let adapters = crate::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
-
-        let adapter = adapters
-            .into_iter()
-            .find(|a| a.get_info().device_type != wgpu::DeviceType::Cpu)
-            .ok_or_else(|| anyhow::anyhow!("No suitable GPU adapter found"))?;
-
-        let info = adapter.get_info();
-        let dual_source_blending = adapter
-            .features()
-            .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
-
-        let color_texture_format = {
-            let required_usages =
-                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
-            let bgra_features =
-                adapter.get_texture_format_features(wgpu::TextureFormat::Bgra8Unorm);
-            if bgra_features.allowed_usages.contains(required_usages) {
-                wgpu::TextureFormat::Bgra8Unorm
-            } else {
-                let rgba_features =
-                    adapter.get_texture_format_features(wgpu::TextureFormat::Rgba8Unorm);
-                if rgba_features.allowed_usages.contains(required_usages) {
-                    log::warn!(
-                        "Adapter {} ({:?}) does not support Bgra8Unorm; \
-                         falling back to Rgba8Unorm.",
-                        info.name,
-                        info.backend,
-                    );
-                    wgpu::TextureFormat::Rgba8Unorm
-                } else {
-                    anyhow::bail!(
-                        "Adapter {} ({:?}) does not support a usable color format.",
-                        info.name,
-                        info.backend,
-                    );
-                }
-            }
-        };
-
-        let handle = GpuContextHandle {
-            device,
-            queue,
-            instance,
-            adapter,
-            color_texture_format,
-            supports_dual_source_blending: dual_source_blending,
-        };
-
-        self.set_gpu_context(handle)
     }
 }
 
@@ -1035,19 +963,19 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// Returns `None` when the platform uses a non-wgpu backend (DirectX, Metal)
     /// or before GPU resources have been initialized by the first frame.
     #[cfg(feature = "wgpu")]
-    fn gpu_context(&self) -> Option<GpuContextHandle> {
+    fn gpu_context(&self) -> Option<WgpuContextHandle> {
         None
     }
 
-    /// Submit an external NV12 frame to the Linux wgpu renderer.
-    #[cfg(all(target_os = "linux", feature = "wgpu"))]
+    /// Stage an external frame for the next normal wgpu submission.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "wgpu"))]
     fn submit_external_frame(&self, _request: ExternalFrameRequest) -> ExternalFrameOutcome {
         ExternalFrameOutcome::Unsupported
     }
 
     /// Take the one-shot outcome produced while the renderer consumed an
     /// external frame request.
-    #[cfg(all(target_os = "linux", feature = "wgpu"))]
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "wgpu"))]
     fn take_external_frame_outcome(&self) -> Option<ExternalFrameOutcome> {
         None
     }
@@ -1591,8 +1519,373 @@ pub enum GpuTextureFormat {
 /// Color space of a GPU texture.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum GpuTextureColorSpace {
+    /// Standard RGB color space.
     #[default]
     Srgb,
+    /// Display P3 color space.
+    DisplayP3,
+    /// ITU-R BT.709 color primaries.
+    Bt709,
+    /// ITU-R BT.2020 color primaries.
+    Bt2020,
+}
+
+/// Alpha interpretation for an RGBA or BGRA surface texture.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum GpuTextureAlphaMode {
+    /// RGB components have already been multiplied by alpha.
+    #[default]
+    Premultiplied,
+    /// RGB components are independent of alpha.
+    Straight,
+    /// The texture is fully opaque.
+    Opaque,
+}
+
+/// YCbCr conversion matrix used by an NV12 surface.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum VideoColorMatrix {
+    /// ITU-R BT.601.
+    Bt601,
+    /// ITU-R BT.709.
+    #[default]
+    Bt709,
+    /// ITU-R BT.2020 non-constant luminance.
+    Bt2020,
+}
+
+/// Transfer function used by an NV12 surface.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum VideoTransferFunction {
+    /// Standard RGB transfer function.
+    Srgb,
+    /// ITU-R BT.709 transfer function.
+    #[default]
+    Bt709,
+    /// ITU-R BT.2020 10-bit transfer function.
+    Bt2020Ten,
+}
+
+/// Encoded component range used by an NV12 surface.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum VideoColorRange {
+    /// Studio/video range.
+    #[default]
+    Limited,
+    /// Full component range.
+    Full,
+}
+
+/// Error returned when a texture cannot be used as a GPUI surface.
+#[cfg(feature = "wgpu")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SurfaceSourceError {
+    /// A texture has an unexpected pixel format.
+    InvalidFormat {
+        /// Plane or texture being validated.
+        plane: &'static str,
+        /// Formats accepted for this source.
+        expected: &'static str,
+        /// Actual texture format.
+        actual: wgpu::TextureFormat,
+    },
+    /// A texture cannot be sampled by the renderer.
+    MissingTextureBindingUsage {
+        /// Plane or texture being validated.
+        plane: &'static str,
+    },
+    /// The declared native dimensions are invalid.
+    InvalidNativeSize,
+    /// The chroma texture does not match the luma dimensions.
+    InvalidChromaSize {
+        /// Expected chroma width.
+        expected_width: u32,
+        /// Expected chroma height.
+        expected_height: u32,
+        /// Actual chroma width.
+        actual_width: u32,
+        /// Actual chroma height.
+        actual_height: u32,
+    },
+}
+
+#[cfg(feature = "wgpu")]
+impl std::fmt::Display for SurfaceSourceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidFormat {
+                plane,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "{plane} texture format must be {expected}, got {actual:?}"
+            ),
+            Self::MissingTextureBindingUsage { plane } => {
+                write!(
+                    formatter,
+                    "{plane} texture is missing TEXTURE_BINDING usage"
+                )
+            }
+            Self::InvalidNativeSize => write!(formatter, "surface native size must be positive"),
+            Self::InvalidChromaSize {
+                expected_width,
+                expected_height,
+                actual_width,
+                actual_height,
+            } => write!(
+                formatter,
+                "NV12 chroma texture must be {expected_width}x{expected_height}, got {actual_width}x{actual_height}"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "wgpu")]
+impl std::error::Error for SurfaceSourceError {}
+
+#[cfg(feature = "wgpu")]
+fn validate_surface_texture_usage(
+    texture: &wgpu::Texture,
+    plane: &'static str,
+) -> Result<(), SurfaceSourceError> {
+    if texture
+        .usage()
+        .contains(wgpu::TextureUsages::TEXTURE_BINDING)
+    {
+        Ok(())
+    } else {
+        Err(SurfaceSourceError::MissingTextureBindingUsage { plane })
+    }
+}
+
+/// Validated RGBA or BGRA texture source for GPUI compositing.
+#[cfg(feature = "wgpu")]
+#[derive(Clone, Debug)]
+pub struct RgbaTextureSource {
+    texture: std::sync::Arc<wgpu::Texture>,
+    native_size: Size<DevicePixels>,
+    alpha_mode: GpuTextureAlphaMode,
+    color_space: GpuTextureColorSpace,
+}
+
+#[cfg(feature = "wgpu")]
+impl RgbaTextureSource {
+    /// Validates and creates an RGBA/BGRA texture source.
+    pub fn new(
+        texture: std::sync::Arc<wgpu::Texture>,
+        native_size: Size<DevicePixels>,
+        alpha_mode: GpuTextureAlphaMode,
+        color_space: GpuTextureColorSpace,
+    ) -> Result<Self, SurfaceSourceError> {
+        if native_size.width.0 <= 0 || native_size.height.0 <= 0 {
+            return Err(SurfaceSourceError::InvalidNativeSize);
+        }
+        if !matches!(
+            texture.format(),
+            wgpu::TextureFormat::Rgba8Unorm
+                | wgpu::TextureFormat::Rgba8UnormSrgb
+                | wgpu::TextureFormat::Bgra8Unorm
+                | wgpu::TextureFormat::Bgra8UnormSrgb
+        ) {
+            return Err(SurfaceSourceError::InvalidFormat {
+                plane: "RGBA",
+                expected: "RGBA8 or BGRA8",
+                actual: texture.format(),
+            });
+        }
+        validate_surface_texture_usage(&texture, "RGBA")?;
+        Ok(Self {
+            texture,
+            native_size,
+            alpha_mode,
+            color_space,
+        })
+    }
+
+    /// Returns the sampled texture.
+    pub fn texture(&self) -> &std::sync::Arc<wgpu::Texture> {
+        &self.texture
+    }
+
+    /// Returns the source dimensions used for object-fit.
+    pub fn native_size(&self) -> Size<DevicePixels> {
+        self.native_size
+    }
+
+    /// Returns the source alpha interpretation.
+    pub fn alpha_mode(&self) -> GpuTextureAlphaMode {
+        self.alpha_mode
+    }
+
+    /// Returns the source color space.
+    pub fn color_space(&self) -> GpuTextureColorSpace {
+        self.color_space
+    }
+}
+
+/// Validated two-plane NV12 texture source for GPUI compositing.
+#[cfg(feature = "wgpu")]
+#[derive(Clone, Debug)]
+pub struct Nv12TextureSource {
+    y_texture: std::sync::Arc<wgpu::Texture>,
+    cb_cr_texture: std::sync::Arc<wgpu::Texture>,
+    native_size: Size<DevicePixels>,
+    matrix: VideoColorMatrix,
+    transfer: VideoTransferFunction,
+    range: VideoColorRange,
+}
+
+#[cfg(feature = "wgpu")]
+impl Nv12TextureSource {
+    /// Validates and creates an NV12 texture source.
+    pub fn new(
+        y_texture: std::sync::Arc<wgpu::Texture>,
+        cb_cr_texture: std::sync::Arc<wgpu::Texture>,
+        native_size: Size<DevicePixels>,
+        matrix: VideoColorMatrix,
+        transfer: VideoTransferFunction,
+        range: VideoColorRange,
+    ) -> Result<Self, SurfaceSourceError> {
+        if native_size.width.0 <= 0 || native_size.height.0 <= 0 {
+            return Err(SurfaceSourceError::InvalidNativeSize);
+        }
+        if y_texture.format() != wgpu::TextureFormat::R8Unorm {
+            return Err(SurfaceSourceError::InvalidFormat {
+                plane: "NV12 luma",
+                expected: "R8Unorm",
+                actual: y_texture.format(),
+            });
+        }
+        if cb_cr_texture.format() != wgpu::TextureFormat::Rg8Unorm {
+            return Err(SurfaceSourceError::InvalidFormat {
+                plane: "NV12 chroma",
+                expected: "Rg8Unorm",
+                actual: cb_cr_texture.format(),
+            });
+        }
+        validate_surface_texture_usage(&y_texture, "NV12 luma")?;
+        validate_surface_texture_usage(&cb_cr_texture, "NV12 chroma")?;
+
+        let expected_width = y_texture.width().div_ceil(2);
+        let expected_height = y_texture.height().div_ceil(2);
+        if cb_cr_texture.width() != expected_width || cb_cr_texture.height() != expected_height {
+            return Err(SurfaceSourceError::InvalidChromaSize {
+                expected_width,
+                expected_height,
+                actual_width: cb_cr_texture.width(),
+                actual_height: cb_cr_texture.height(),
+            });
+        }
+
+        Ok(Self {
+            y_texture,
+            cb_cr_texture,
+            native_size,
+            matrix,
+            transfer,
+            range,
+        })
+    }
+
+    /// Returns the luma texture.
+    pub fn y_texture(&self) -> &std::sync::Arc<wgpu::Texture> {
+        &self.y_texture
+    }
+
+    /// Returns the interleaved chroma texture.
+    pub fn cb_cr_texture(&self) -> &std::sync::Arc<wgpu::Texture> {
+        &self.cb_cr_texture
+    }
+
+    /// Returns the source dimensions used for object-fit.
+    pub fn native_size(&self) -> Size<DevicePixels> {
+        self.native_size
+    }
+
+    /// Returns the YCbCr conversion matrix.
+    pub fn matrix(&self) -> VideoColorMatrix {
+        self.matrix
+    }
+
+    /// Returns the transfer function.
+    pub fn transfer(&self) -> VideoTransferFunction {
+        self.transfer
+    }
+
+    /// Returns the encoded component range.
+    pub fn range(&self) -> VideoColorRange {
+        self.range
+    }
+}
+
+/// Coherent external wgpu context supplied to GPUI before opening windows.
+#[cfg(feature = "wgpu")]
+pub struct WgpuContextDescriptor {
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    device: std::sync::Arc<wgpu::Device>,
+    queue: std::sync::Arc<wgpu::Queue>,
+}
+
+#[cfg(feature = "wgpu")]
+impl WgpuContextDescriptor {
+    /// Creates a descriptor from resources belonging to one wgpu context.
+    pub fn new(
+        instance: wgpu::Instance,
+        adapter: wgpu::Adapter,
+        device: std::sync::Arc<wgpu::Device>,
+        queue: std::sync::Arc<wgpu::Queue>,
+    ) -> Self {
+        Self {
+            instance,
+            adapter,
+            device,
+            queue,
+        }
+    }
+
+    /// Consumes the descriptor and returns its wgpu resources.
+    pub fn into_parts(
+        self,
+    ) -> (
+        wgpu::Instance,
+        wgpu::Adapter,
+        std::sync::Arc<wgpu::Device>,
+        std::sync::Arc<wgpu::Queue>,
+    ) {
+        (self.instance, self.adapter, self.device, self.queue)
+    }
+}
+
+/// Platform identity and native-handle hints for the renderer adapter.
+#[cfg(feature = "wgpu")]
+#[derive(Clone, Debug)]
+pub struct WgpuAdapterIdentity {
+    /// PCI vendor identifier, when reported by wgpu.
+    pub vendor_id: u32,
+    /// PCI device identifier, when reported by wgpu.
+    pub device_id: u32,
+    /// Human-readable adapter name.
+    pub name: String,
+    /// Active wgpu backend.
+    pub backend: wgpu::Backend,
+    /// DRM render node corresponding to the adapter, when resolved.
+    pub drm_render_node: Option<std::path::PathBuf>,
+    /// Windows adapter LUID, when available.
+    pub windows_luid: Option<u64>,
+}
+
+/// Native external-memory families potentially usable by this context.
+#[cfg(feature = "wgpu")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WgpuExternalMemoryCapabilities {
+    /// IOSurface import may be implemented by the integration layer.
+    pub iosurface: bool,
+    /// DMABuf import may be implemented by the integration layer.
+    pub dmabuf: bool,
+    /// D3D shared-handle import may be implemented by the integration layer.
+    pub d3d_shared_handle: bool,
 }
 
 /// Handle to the GPU resources backing the renderer.
@@ -1605,22 +1898,15 @@ pub enum GpuTextureColorSpace {
 /// and sent to background threads for texture creation.
 #[cfg(feature = "wgpu")]
 #[derive(Clone)]
-pub struct GpuContextHandle {
-    /// The wgpu device. All GPUI rendering shares this device.
-    pub device: std::sync::Arc<wgpu::Device>,
-    /// The wgpu queue used for command submission.
-    pub queue: std::sync::Arc<wgpu::Queue>,
-    /// The wgpu instance. Needed for importing textures from external
-    /// sources (e.g., IOSurface, D3D shared handles).
-    pub instance: wgpu::Instance,
-    /// The wgpu adapter. Useful for querying feature support and limits.
-    pub adapter: wgpu::Adapter,
-    /// The color texture format used by the renderer's internal atlas and
-    /// surface. Textures created with this format will be most efficient.
-    pub color_texture_format: wgpu::TextureFormat,
-    /// Whether the device supports dual-source blending (enables subpixel
-    /// text antialiasing).
-    pub supports_dual_source_blending: bool,
+pub struct WgpuContextHandle {
+    device: std::sync::Arc<wgpu::Device>,
+    queue: std::sync::Arc<wgpu::Queue>,
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    adapter_info: wgpu::AdapterInfo,
+    color_texture_format: wgpu::TextureFormat,
+    supports_dual_source_blending: bool,
+    drm_render_node: Option<std::path::PathBuf>,
 }
 
 /// Queue-family ownership held by the producer of an external Linux image.
@@ -1683,11 +1969,66 @@ impl ExternalNv12Frame {
     }
 }
 
-/// A typed request to submit an external NV12 frame.
-#[cfg(all(target_os = "linux", feature = "wgpu"))]
+/// RGBA conversion work to submit immediately before the scene that samples it.
+#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "wgpu"))]
+pub struct ExternalRgbaFrame {
+    // Drop unsubmitted commands before their output texture.
+    commands: wgpu::CommandBuffer,
+    texture: Arc<wgpu::Texture>,
+}
+
+#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "wgpu"))]
+impl ExternalRgbaFrame {
+    /// Validate the output sampled by the renderer.
+    ///
+    /// # Safety
+    /// The texture and commands must belong to this window's wgpu device.
+    /// Commands must initialize the texture for sampling and retain every native
+    /// resource and producer lease until GPU completion through wgpu tracking.
+    /// Producer synchronization must already be resolved or encoded in commands;
+    /// neither resource may be concurrently used through an unsynchronized queue.
+    pub unsafe fn new(
+        texture: Arc<wgpu::Texture>,
+        commands: wgpu::CommandBuffer,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            matches!(
+                texture.format(),
+                wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Bgra8Unorm
+            ),
+            "prepared external RGBA texture must use Rgba8Unorm or Bgra8Unorm"
+        );
+        anyhow::ensure!(
+            texture.dimension() == wgpu::TextureDimension::D2
+                && texture.width() > 0
+                && texture.height() > 0
+                && texture.depth_or_array_layers() == 1
+                && texture.sample_count() == 1,
+            "prepared external RGBA texture must be a single-sample 2D image"
+        );
+        anyhow::ensure!(
+            texture
+                .usage()
+                .contains(wgpu::TextureUsages::TEXTURE_BINDING),
+            "prepared external RGBA texture must allow texture binding"
+        );
+        Ok(Self { commands, texture })
+    }
+
+    /// Consume the prepared work and its GPU-tracked output.
+    pub fn into_parts(self) -> (Arc<wgpu::Texture>, wgpu::CommandBuffer) {
+        (self.texture, self.commands)
+    }
+}
+
+/// A typed request to stage an external frame for normal renderer submission.
+#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "wgpu"))]
 pub enum ExternalFrameRequest {
-    /// The producer prepared a frame for submission.
+    /// The producer prepared a Linux NV12 frame for submission.
+    #[cfg(target_os = "linux")]
     Prepared(ExternalNv12Frame),
+    /// GPU conversion work and its RGBA output, submitted before sampling.
+    PreparedRgba(ExternalRgbaFrame),
     /// The producer could not acquire a frame this tick.
     TransientFailure,
     /// The producer encountered an unrecoverable failure.
@@ -1735,6 +2076,128 @@ impl ExternalFrameOutcome {
         }
     }
 }
+#[cfg(feature = "wgpu")]
+impl WgpuContextHandle {
+    /// Creates a handle from a coherent context descriptor.
+    pub fn from_descriptor(descriptor: WgpuContextDescriptor) -> anyhow::Result<Self> {
+        let (instance, adapter, device, queue) = descriptor.into_parts();
+        let adapter_info = adapter.get_info();
+        let color_texture_format = {
+            let required = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
+            if adapter
+                .get_texture_format_features(wgpu::TextureFormat::Bgra8Unorm)
+                .allowed_usages
+                .contains(required)
+            {
+                wgpu::TextureFormat::Bgra8Unorm
+            } else if adapter
+                .get_texture_format_features(wgpu::TextureFormat::Rgba8Unorm)
+                .allowed_usages
+                .contains(required)
+            {
+                wgpu::TextureFormat::Rgba8Unorm
+            } else {
+                anyhow::bail!(
+                    "adapter {} does not support a sampleable RGBA8 or BGRA8 texture",
+                    adapter_info.name
+                );
+            }
+        };
+        let supports_dual_source_blending = adapter
+            .features()
+            .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
+        Ok(Self {
+            device,
+            queue,
+            instance,
+            adapter,
+            adapter_info,
+            color_texture_format,
+            supports_dual_source_blending,
+            drm_render_node: None,
+        })
+    }
+
+    /// Returns the renderer device.
+    pub fn device(&self) -> &std::sync::Arc<wgpu::Device> {
+        &self.device
+    }
+
+    /// Returns the renderer submission queue.
+    pub fn queue(&self) -> &std::sync::Arc<wgpu::Queue> {
+        &self.queue
+    }
+
+    /// Returns the renderer instance.
+    pub fn instance(&self) -> &wgpu::Instance {
+        &self.instance
+    }
+
+    /// Returns the renderer adapter.
+    pub fn adapter(&self) -> &wgpu::Adapter {
+        &self.adapter
+    }
+
+    /// Returns cached adapter information.
+    pub fn adapter_info(&self) -> &wgpu::AdapterInfo {
+        &self.adapter_info
+    }
+
+    /// Record a render node identified from this adapter's native DRM properties.
+    /// The renderer must use an exact device identity, never a vendor/device-ID
+    /// match, which is ambiguous when multiple identical GPUs are installed.
+    #[cfg(target_os = "linux")]
+    pub fn with_drm_render_node(mut self, render_node: Option<std::path::PathBuf>) -> Self {
+        self.drm_render_node = render_node;
+        self
+    }
+
+    /// Returns adapter identity used to align decoder device selection.
+    pub fn adapter_identity(&self) -> WgpuAdapterIdentity {
+        WgpuAdapterIdentity {
+            vendor_id: self.adapter_info.vendor,
+            device_id: self.adapter_info.device,
+            name: self.adapter_info.name.clone(),
+            backend: self.adapter_info.backend,
+            drm_render_node: self.drm_render_node.clone(),
+            windows_luid: None,
+        }
+    }
+
+    /// Returns native external-memory families associated with the backend.
+    pub fn external_memory_capabilities(&self) -> WgpuExternalMemoryCapabilities {
+        WgpuExternalMemoryCapabilities {
+            iosurface: self.adapter_info.backend == wgpu::Backend::Metal,
+            dmabuf: self.adapter_info.backend == wgpu::Backend::Vulkan,
+            d3d_shared_handle: self.adapter_info.backend == wgpu::Backend::Dx12,
+        }
+    }
+
+    /// Returns the preferred renderer color texture format.
+    pub fn color_texture_format(&self) -> wgpu::TextureFormat {
+        self.color_texture_format
+    }
+
+    /// Returns whether dual-source blending is enabled.
+    pub fn supports_dual_source_blending(&self) -> bool {
+        self.supports_dual_source_blending
+    }
+
+    /// Returns a cloneable descriptor for injecting this context elsewhere.
+    pub fn descriptor(&self) -> WgpuContextDescriptor {
+        WgpuContextDescriptor::new(
+            self.instance.clone(),
+            self.adapter.clone(),
+            self.device.clone(),
+            self.queue.clone(),
+        )
+    }
+}
+
+/// Compatibility alias for code migrating to [`WgpuContextHandle`].
+#[cfg(feature = "wgpu")]
+#[deprecated(note = "use WgpuContextHandle")]
+pub type GpuContextHandle = WgpuContextHandle;
 
 #[expect(missing_docs)]
 pub struct PlatformInputHandler {

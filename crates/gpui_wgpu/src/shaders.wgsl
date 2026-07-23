@@ -1315,7 +1315,8 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
 struct SurfaceParams {
     bounds: Bounds,
     content_mask: Bounds,
-    yuv_to_rgb: mat4x4<f32>,
+    ycbcr_to_rgb: mat4x4<f32>,
+    transfer: u32,
 }
 
 @group(1) @binding(0) var<uniform> surface_locals: SurfaceParams;
@@ -1327,6 +1328,49 @@ struct SurfaceVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) texture_position: vec2<f32>,
     @location(3) clip_distances: vec4<f32>,
+}
+
+fn video_linear_component_to_srgb(component: f32) -> f32 {
+    if (component <= 0.0031308) {
+        return 12.92 * component;
+    }
+    return 1.055 * pow(component, 1.0 / 2.4) - 0.055;
+}
+
+fn bt709_to_linear(component: f32) -> f32 {
+    if (component < 0.081) {
+        return component / 4.5;
+    }
+    return pow((component + 0.099) / 1.099, 1.0 / 0.45);
+}
+
+fn bt2020_ten_to_linear(component: f32) -> f32 {
+    const ALPHA: f32 = 1.0993;
+    const BETA: f32 = 0.0181;
+    if (component < 4.5 * BETA) {
+        return component / 4.5;
+    }
+    return pow((component + ALPHA - 1.0) / ALPHA, 1.0 / 0.45);
+}
+
+fn video_transfer_to_srgb_component(component: f32, transfer: u32) -> f32 {
+    let encoded = clamp(component, 0.0, 1.0);
+    if (transfer == 0u) {
+        return encoded;
+    }
+    var linear = bt709_to_linear(encoded);
+    if (transfer == 2u) {
+        linear = bt2020_ten_to_linear(encoded);
+    }
+    return clamp(video_linear_component_to_srgb(linear), 0.0, 1.0);
+}
+
+fn video_transfer_to_srgb(color: vec3<f32>, transfer: u32) -> vec3<f32> {
+    return vec3<f32>(
+        video_transfer_to_srgb_component(color.r, transfer),
+        video_transfer_to_srgb_component(color.g, transfer),
+        video_transfer_to_srgb_component(color.b, transfer),
+    );
 }
 
 @vertex
@@ -1352,39 +1396,15 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
         textureSampleLevel(t_cb_cr, s_surface, input.texture_position, 0.0).rg,
         1.0);
 
-    return surface_locals.yuv_to_rgb * y_cb_cr;
+    let encoded_rgb = (surface_locals.ycbcr_to_rgb * y_cb_cr).rgb;
+    return vec4<f32>(video_transfer_to_srgb(encoded_rgb, surface_locals.transfer), 1.0);
 }
 
-// --- surfaces RGBA passthrough --- //
-// Samples a single RGBA texture and outputs the color directly.
-// Uses instance-based storage buffer for bounds / content_mask,
-// and per-surface bind groups for the texture + sampler.
-
-struct SurfaceInstance {
-    bounds: Bounds,
-    content_mask: Bounds,
-}
-
-@group(1) @binding(0) var<storage, read> b_surface_instances: array<SurfaceInstance>;
-@group(1) @binding(1) var surface_rgba_texture: texture_2d<f32>;
-@group(1) @binding(2) var surface_rgba_sampler: sampler;
-
-@vertex
-fn vs_surface_rgba(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> SurfaceVarying {
-    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
-    let surface = b_surface_instances[instance_id];
-
-    var out = SurfaceVarying();
-    out.position = to_device_position(unit_vertex, surface.bounds);
-    out.texture_position = unit_vertex;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, surface.bounds, surface.content_mask);
-    return out;
-}
-
+// RGBA surfaces share bounds and clipping uniforms with NV12 surfaces.
 @fragment
 fn fs_surface_rgba(input: SurfaceVarying) -> @location(0) vec4<f32> {
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
-    return textureSample(surface_rgba_texture, surface_rgba_sampler, input.texture_position);
+    return textureSampleLevel(t_y, s_surface, input.texture_position, 0.0);
 }

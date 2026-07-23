@@ -2,8 +2,8 @@
 
 //! Demonstrates the `surface()` element with real wgpu textures:
 //!
-//! 1. RGBA8 triangle (barycentric interpolation) — `surface((tex, desc))`
-//! 2. NV12 (Y+CbCr planes) — `surface((y_tex, cb_cr_tex, size))`
+//! 1. RGBA8 triangle (barycentric interpolation)
+//! 2. NV12 (Y+CbCr planes) with explicit BT.709 limited-range metadata
 //!
 //! Uses `Window::gpu_context()` to obtain the renderer's wgpu device.
 //!
@@ -12,10 +12,10 @@
 //! ```
 
 use gpui::{
-    App, Bounds, Context, DevicePixels, GpuContextHandle, GpuTextureColorSpace,
-    GpuTextureDescriptor, GpuTextureFormat, IntoElement, ObjectFit, ParentElement,
-    Render, SharedString, Styled, Window, WindowBounds, WindowOptions,
-    div, prelude::*, px, rgb, size, surface,
+    App, Bounds, Context, DevicePixels, GpuTextureAlphaMode, GpuTextureColorSpace, IntoElement,
+    Nv12TextureSource, ObjectFit, ParentElement, Render, RgbaTextureSource, SharedString, Styled,
+    VideoColorMatrix, VideoColorRange, VideoTransferFunction, WgpuContextHandle, Window,
+    WindowBounds, WindowOptions, div, prelude::*, px, rgb, size, surface,
 };
 use gpui_platform::application;
 #[cfg(feature = "wgpu")]
@@ -37,18 +37,6 @@ const TEX_HEIGHT: u32 = 256;
 const NV12_TEX_WIDTH: u32 = 256;
 const NV12_TEX_HEIGHT: u32 = 256;
 
-/// Build the descriptor that matches our hand-drawn triangle texture.
-fn make_descriptor() -> GpuTextureDescriptor {
-    GpuTextureDescriptor {
-        size: size(
-            DevicePixels::from(TEX_WIDTH as i32),
-            DevicePixels::from(TEX_HEIGHT as i32),
-        ),
-        format: GpuTextureFormat::Rgba8Unorm,
-        color_space: GpuTextureColorSpace::Srgb,
-    }
-}
-
 /// Fill an RGBA8 buffer with a colourful triangle using barycentric
 /// interpolation.  Corners are red (top), green (bottom-left), blue
 /// (bottom-right).
@@ -56,9 +44,9 @@ fn make_descriptor() -> GpuTextureDescriptor {
 fn fill_triangle_pixels(pixels: &mut [u8], width: u32, height: u32) {
     // Triangle fills nearly the entire canvas with minimal padding.
     let margin = 4.0;
-    let v0 = (width as f32 * 0.5, margin);                     // top    → red
-    let v1 = (margin, height as f32 - margin);                 // left   → green
-    let v2 = (width as f32 - margin, height as f32 - margin);  // right  → blue
+    let v0 = (width as f32 * 0.5, margin); // top    → red
+    let v1 = (margin, height as f32 - margin); // left   → green
+    let v2 = (width as f32 - margin, height as f32 - margin); // right  → blue
 
     // Colours at each vertex (premultiplied alpha, sRGB-ish for demo).
     let c0 = (1.0f32, 0.2, 0.2);
@@ -100,18 +88,14 @@ fn fill_triangle_pixels(pixels: &mut [u8], width: u32, height: u32) {
 
 /// Edge function from a to b, evaluated at point c.
 #[cfg(feature = "wgpu")]
-fn edge_function(
-    a: (f32, f32),
-    b: (f32, f32),
-    c: (f32, f32),
-) -> f32 {
+fn edge_function(a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> f32 {
     (c.0 - a.0) * (b.1 - a.1) - (c.1 - a.1) * (b.0 - a.0)
 }
 
 /// Build an RGBA8 wgpu texture containing a colourful triangle.
 #[cfg(feature = "wgpu")]
-fn create_triangle_texture(gpu: &GpuContextHandle) -> Arc<wgpu::Texture> {
-    let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+fn create_triangle_texture(gpu: &WgpuContextHandle) -> Arc<wgpu::Texture> {
+    let texture = gpu.device().create_texture(&wgpu::TextureDescriptor {
         label: Some("triangle_texture"),
         size: wgpu::Extent3d {
             width: TEX_WIDTH,
@@ -129,7 +113,7 @@ fn create_triangle_texture(gpu: &GpuContextHandle) -> Arc<wgpu::Texture> {
     let mut pixels = vec![0u8; (TEX_WIDTH * TEX_HEIGHT * 4) as usize];
     fill_triangle_pixels(&mut pixels, TEX_WIDTH, TEX_HEIGHT);
 
-    gpu.queue.write_texture(
+    gpu.queue().write_texture(
         wgpu::TexelCopyTextureInfo {
             texture: &texture,
             mip_level: 0,
@@ -152,18 +136,6 @@ fn create_triangle_texture(gpu: &GpuContextHandle) -> Arc<wgpu::Texture> {
     Arc::new(texture)
 }
 
-/// Build the descriptor for the NV12 test texture.
-fn make_nv12_descriptor() -> GpuTextureDescriptor {
-    GpuTextureDescriptor {
-        size: size(
-            DevicePixels::from(NV12_TEX_WIDTH as i32),
-            DevicePixels::from(NV12_TEX_HEIGHT as i32),
-        ),
-        format: GpuTextureFormat::Nv12,
-        color_space: GpuTextureColorSpace::Srgb,
-    }
-}
-
 /// Fill NV12 Y and CbCr planes with a colour-bar test pattern.
 ///
 /// Y plane: horizontal gradient from black (16) to white (235) — video range.
@@ -171,26 +143,27 @@ fn make_nv12_descriptor() -> GpuTextureDescriptor {
 /// Cr plane: vertical gradient from green (16) to red (240).
 /// Centre is neutral grey.
 #[cfg(feature = "wgpu")]
-fn fill_nv12_test_pixels(
-    y_plane: &mut [u8],
-    cb_cr_plane: &mut [u8],
-    width: u32,
-    height: u32,
-) {
+fn fill_nv12_test_pixels(y_plane: &mut [u8], cb_cr_plane: &mut [u8], width: u32, height: u32) {
     for row in 0..height {
         for col in 0..width {
             let y_idx = (row * width + col) as usize;
-            let cb_cr_idx = y_idx * 2;
 
             // Y: horizontal ramp 16→235
             let y_val = 16.0 + (col as f32 / (width - 1) as f32) * (235.0 - 16.0);
             y_plane[y_idx] = y_val as u8;
+        }
+    }
 
+    let chroma_width = width.div_ceil(2);
+    let chroma_height = height.div_ceil(2);
+    for row in 0..chroma_height {
+        for col in 0..chroma_width {
+            let cb_cr_idx = (row * chroma_width + col) as usize * 2;
             // Cb: horizontal ramp 16→240 (blue → yellow)
-            let cb_val = 16.0 + (col as f32 / (width - 1) as f32) * (240.0 - 16.0);
+            let cb_val = 16.0 + (col as f32 / (chroma_width - 1) as f32) * (240.0 - 16.0);
 
             // Cr: vertical ramp 16→240 (green → red)
-            let cr_val = 16.0 + (row as f32 / (height - 1) as f32) * (240.0 - 16.0);
+            let cr_val = 16.0 + (row as f32 / (chroma_height - 1) as f32) * (240.0 - 16.0);
 
             cb_cr_plane[cb_cr_idx] = cb_val as u8;
             cb_cr_plane[cb_cr_idx + 1] = cr_val as u8;
@@ -200,10 +173,8 @@ fn fill_nv12_test_pixels(
 
 /// Create NV12 test textures: Y plane (R8Unorm) + CbCr plane (Rg8Unorm).
 #[cfg(feature = "wgpu")]
-fn create_nv12_test_textures(
-    gpu: &GpuContextHandle,
-) -> (Arc<wgpu::Texture>, Arc<wgpu::Texture>) {
-    let y_texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+fn create_nv12_test_textures(gpu: &WgpuContextHandle) -> (Arc<wgpu::Texture>, Arc<wgpu::Texture>) {
+    let y_texture = gpu.device().create_texture(&wgpu::TextureDescriptor {
         label: Some("nv12_y"),
         size: wgpu::Extent3d {
             width: NV12_TEX_WIDTH,
@@ -218,11 +189,11 @@ fn create_nv12_test_textures(
         view_formats: &[],
     });
 
-    let cb_cr_texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+    let cb_cr_texture = gpu.device().create_texture(&wgpu::TextureDescriptor {
         label: Some("nv12_cb_cr"),
         size: wgpu::Extent3d {
-            width: NV12_TEX_WIDTH,
-            height: NV12_TEX_HEIGHT,
+            width: NV12_TEX_WIDTH.div_ceil(2),
+            height: NV12_TEX_HEIGHT.div_ceil(2),
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -234,12 +205,19 @@ fn create_nv12_test_textures(
     });
 
     let y_len = (NV12_TEX_WIDTH * NV12_TEX_HEIGHT) as usize;
-    let cb_cr_len = y_len * 2;
+    let chroma_width = NV12_TEX_WIDTH.div_ceil(2);
+    let chroma_height = NV12_TEX_HEIGHT.div_ceil(2);
+    let cb_cr_len = (chroma_width * chroma_height * 2) as usize;
     let mut y_plane = vec![0u8; y_len];
     let mut cb_cr_plane = vec![0u8; cb_cr_len];
-    fill_nv12_test_pixels(&mut y_plane, &mut cb_cr_plane, NV12_TEX_WIDTH, NV12_TEX_HEIGHT);
+    fill_nv12_test_pixels(
+        &mut y_plane,
+        &mut cb_cr_plane,
+        NV12_TEX_WIDTH,
+        NV12_TEX_HEIGHT,
+    );
 
-    gpu.queue.write_texture(
+    gpu.queue().write_texture(
         wgpu::TexelCopyTextureInfo {
             texture: &y_texture,
             mip_level: 0,
@@ -259,7 +237,7 @@ fn create_nv12_test_textures(
         },
     );
 
-    gpu.queue.write_texture(
+    gpu.queue().write_texture(
         wgpu::TexelCopyTextureInfo {
             texture: &cb_cr_texture,
             mip_level: 0,
@@ -269,12 +247,12 @@ fn create_nv12_test_textures(
         &cb_cr_plane,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(NV12_TEX_WIDTH * 2),
-            rows_per_image: Some(NV12_TEX_HEIGHT),
+            bytes_per_row: Some(chroma_width * 2),
+            rows_per_image: Some(chroma_height),
         },
         wgpu::Extent3d {
-            width: NV12_TEX_WIDTH,
-            height: NV12_TEX_HEIGHT,
+            width: chroma_width,
+            height: chroma_height,
             depth_or_array_layers: 1,
         },
     );
@@ -289,8 +267,8 @@ impl Render for SurfaceDemo {
             if let Some(gpu) = window.gpu_context() {
                 self.device_info = SharedString::from(format!(
                     "wgpu: {:?} dual_src={}",
-                    gpu.color_texture_format,
-                    gpu.supports_dual_source_blending
+                    gpu.color_texture_format(),
+                    gpu.supports_dual_source_blending()
                 ));
                 if self.triangle_texture.is_none() {
                     self.triangle_texture = Some(create_triangle_texture(&gpu));
@@ -303,8 +281,36 @@ impl Render for SurfaceDemo {
             }
         }
 
-        let descriptor = make_descriptor();
-        let nv12_descriptor = make_nv12_descriptor();
+        let rgba_source = self.triangle_texture.as_ref().and_then(|texture| {
+            RgbaTextureSource::new(
+                texture.clone(),
+                size(
+                    DevicePixels::from(TEX_WIDTH as i32),
+                    DevicePixels::from(TEX_HEIGHT as i32),
+                ),
+                GpuTextureAlphaMode::Premultiplied,
+                GpuTextureColorSpace::Srgb,
+            )
+            .ok()
+        });
+        let nv12_source = self
+            .nv12_y_texture
+            .as_ref()
+            .zip(self.nv12_cb_cr_texture.as_ref())
+            .and_then(|(y_texture, cb_cr_texture)| {
+                Nv12TextureSource::new(
+                    y_texture.clone(),
+                    cb_cr_texture.clone(),
+                    size(
+                        DevicePixels::from(NV12_TEX_WIDTH as i32),
+                        DevicePixels::from(NV12_TEX_HEIGHT as i32),
+                    ),
+                    VideoColorMatrix::Bt709,
+                    VideoTransferFunction::Bt709,
+                    VideoColorRange::Limited,
+                )
+                .ok()
+            });
 
         div()
             .flex()
@@ -360,13 +366,10 @@ impl Render for SurfaceDemo {
                                     .overflow_hidden()
                                     .child(
                                         #[cfg(feature = "wgpu")]
-                                        if let Some(ref tex) = self.triangle_texture {
-                                            surface((
-                                                tex.clone(),
-                                                Some(descriptor.size),
-                                            ))
-                                            .object_fit(ObjectFit::Contain)
-                                            .into_any_element()
+                                        if let Some(ref source) = rgba_source {
+                                            surface(source.clone())
+                                                .object_fit(ObjectFit::Contain)
+                                                .into_any_element()
                                         } else {
                                             placeholder_fallback("Loading...").into_any_element()
                                         },
@@ -397,8 +400,8 @@ impl Render for SurfaceDemo {
                                     .overflow_hidden()
                                     .child(
                                         #[cfg(feature = "wgpu")]
-                                        if let Some(ref tex) = self.triangle_texture {
-                                            surface(tex.clone())
+                                        if let Some(ref source) = rgba_source {
+                                            surface(source.clone())
                                                 .object_fit(ObjectFit::Fill)
                                                 .size_full()
                                                 .into_any_element()
@@ -438,16 +441,10 @@ impl Render for SurfaceDemo {
                                     .overflow_hidden()
                                     .child(
                                         #[cfg(feature = "wgpu")]
-                                        if let (Some(y_tex), Some(cb_cr_tex)) =
-                                            (&self.nv12_y_texture, &self.nv12_cb_cr_texture)
-                                        {
-                                            surface((
-                                                y_tex.clone(),
-                                                cb_cr_tex.clone(),
-                                                nv12_descriptor.size,
-                                            ))
-                                            .object_fit(ObjectFit::Contain)
-                                            .into_any_element()
+                                        if let Some(ref source) = nv12_source {
+                                            surface(source.clone())
+                                                .object_fit(ObjectFit::Contain)
+                                                .into_any_element()
                                         } else {
                                             placeholder_fallback("Loading...").into_any_element()
                                         },
@@ -478,17 +475,11 @@ impl Render for SurfaceDemo {
                                     .overflow_hidden()
                                     .child(
                                         #[cfg(feature = "wgpu")]
-                                        if let (Some(y_tex), Some(cb_cr_tex)) =
-                                            (&self.nv12_y_texture, &self.nv12_cb_cr_texture)
-                                        {
-                                            surface((
-                                                y_tex.clone(),
-                                                cb_cr_tex.clone(),
-                                                nv12_descriptor.size,
-                                            ))
-                                            .object_fit(ObjectFit::Fill)
-                                            .size_full()
-                                            .into_any_element()
+                                        if let Some(ref source) = nv12_source {
+                                            surface(source.clone())
+                                                .object_fit(ObjectFit::Fill)
+                                                .size_full()
+                                                .into_any_element()
                                         } else {
                                             placeholder_fallback("Loading...").into_any_element()
                                         },
@@ -498,7 +489,7 @@ impl Render for SurfaceDemo {
                             ),
                     ),
             )
-             .child(
+            .child(
                 // API info — one text block
                 div()
                     .border_1()
@@ -510,7 +501,7 @@ impl Render for SurfaceDemo {
                     .child(SharedString::from(format!(
                         "Texture: {}×{} RGBA8 + {}×{} NV12  |  \
                          ObjectFit::Contain / Fill  |  \
-                         surface((tex, desc)) / surface((y, cbcr, size))",
+                         validated RGBA/NV12 surface sources",
                         TEX_WIDTH, TEX_HEIGHT, NV12_TEX_WIDTH, NV12_TEX_HEIGHT,
                     ))),
             )
