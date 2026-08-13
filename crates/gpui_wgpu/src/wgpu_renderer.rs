@@ -193,6 +193,10 @@ pub struct VulkanExternalFrame {
 impl VulkanExternalFrame {
     /// Describe an initialized producer image and take ownership of its sync
     /// file descriptor until the renderer consumes it.
+    ///
+    /// The producer must have completed any Vulkan queue-family ownership
+    /// transfer before constructing this descriptor. wgpu 30 cannot encode
+    /// that transfer through its public HAL transition API.
     pub fn new(
         image: vk::Image,
         size: wgpu::Extent3d,
@@ -200,15 +204,20 @@ impl VulkanExternalFrame {
         initial_state: wgpu::TextureUses,
         sync_file: OwnedFd,
         lease: impl FnOnce() + Send + Sync + 'static,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        let lease: ExternalFrameLease = Box::new(lease);
+        if let Err(error) = ensure_external_frame_initial_state(initial_state) {
+            lease();
+            return Err(error);
+        }
+        Ok(Self {
             image,
             size,
             format,
             initial_state,
             sync_file: Some(sync_file),
-            lease: Some(Box::new(lease)),
-        }
+            lease: Some(lease),
+        })
     }
 }
 
@@ -225,11 +234,10 @@ impl Drop for VulkanExternalFrame {
 ///
 /// Vulkan imports retain their acquire fence until the next draw submission
 /// and release their producer lease from the HAL texture drop callback.
-#[derive(Clone)]
 pub struct PreparedExternalFrame {
     #[cfg(target_os = "linux")]
     // Drop the Vulkan sync object before the texture's device reference.
-    external_sync: Option<Arc<Mutex<VulkanExternalSync>>>,
+    external_sync: Option<VulkanExternalSync>,
     texture: Arc<wgpu::Texture>,
 }
 
@@ -253,10 +261,18 @@ impl PreparedExternalFrame {
     ///
     /// The sync file remains pending until the next normal renderer submit;
     /// this lets the draw call stage the wait in wgpu's queue ordering.
+    /// The producer must have completed any Vulkan queue-family ownership
+    /// transfer before calling this function. wgpu 30's
+    /// `create_texture_from_hal` tracks only `TextureUses` layout/state; its
+    /// Vulkan `transition_textures` path has no queue-family fields. See the
+    /// pinned wgpu sources at `wgpu/src/api/device.rs:323-338`,
+    /// `wgpu-hal/src/lib.rs:1452-1454`, and
+    /// `wgpu-hal/src/vulkan/command.rs:235-260`.
     pub fn from_vulkan(
         context: &gpui::GpuContextHandle,
         mut frame: VulkanExternalFrame,
     ) -> anyhow::Result<Self> {
+        ensure_external_frame_initial_state(frame.initial_state)?;
         anyhow::ensure!(
             frame.image != vk::Image::null(),
             "external image handle is null"
@@ -292,12 +308,14 @@ impl PreparedExternalFrame {
             .sync_file
             .take()
             .ok_or_else(|| anyhow::anyhow!("external frame sync file was already consumed"))?;
-        let external_sync = Arc::new(Mutex::new(VulkanExternalSync {
+        let external_sync = VulkanExternalSync {
             fd: Some(sync_file),
             device: raw_device,
             external_semaphore_fd,
             semaphore: None,
-        }));
+            #[cfg(test)]
+            completion_probe: None,
+        };
 
         let texture_descriptor = wgpu::TextureDescriptor {
             label: Some("external_frame"),
@@ -354,8 +372,8 @@ impl PreparedExternalFrame {
     }
 
     #[cfg(target_os = "linux")]
-    fn prepare_submission(&self, queue: &wgpu::Queue) -> Result<(), vk::Result> {
-        let Some(external_sync) = self.external_sync.as_ref() else {
+    fn prepare_submission(&mut self, queue: &wgpu::Queue) -> Result<(), vk::Result> {
+        let Some(external_sync) = self.external_sync.as_mut() else {
             return Ok(());
         };
 
@@ -363,22 +381,16 @@ impl PreparedExternalFrame {
         let Some(queue_hal) = (unsafe { queue.as_hal::<wgpu::hal::api::Vulkan>() }) else {
             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
         };
-        external_sync
-            .lock()
-            .map_err(|_| vk::Result::ERROR_DEVICE_LOST)?
-            .import_and_wait(&queue_hal)
+        external_sync.import_and_wait(&queue_hal)
     }
 
     #[cfg(target_os = "linux")]
-    fn on_submitted(&self, queue: &wgpu::Queue) {
-        let Some(external_sync) = self.external_sync.as_ref() else {
+    fn on_submitted(&mut self, queue: &wgpu::Queue) {
+        let Some(external_sync) = self.external_sync.take() else {
             return;
         };
-        let external_sync = Arc::clone(external_sync);
         queue.on_submitted_work_done(move || {
-            if let Ok(mut external_sync) = external_sync.lock() {
-                external_sync.destroy_semaphore();
-            }
+            drop(external_sync);
         });
     }
 }
@@ -386,7 +398,7 @@ impl PreparedExternalFrame {
 #[cfg(target_os = "linux")]
 impl ExternalFrameState<PreparedExternalFrame> {
     fn prepare_submission(&mut self, queue: &wgpu::Queue) -> ExternalFrameOutcome {
-        let Some(frame) = self.latest.as_ref() else {
+        let Some(frame) = self.latest.as_mut() else {
             return ExternalFrameOutcome::Accepted;
         };
 
@@ -399,11 +411,20 @@ impl ExternalFrameState<PreparedExternalFrame> {
     }
 
     fn commit_after_submission_with_queue(&mut self, queue: &wgpu::Queue) {
-        if let Some(frame) = self.latest.take() {
+        if let Some(mut frame) = self.latest.take() {
             frame.on_submitted(queue);
             self.displayed = Some(frame);
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_external_frame_initial_state(initial_state: wgpu::TextureUses) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !initial_state.contains(wgpu::TextureUses::UNINITIALIZED),
+        "external frame initial state must describe initialized producer contents"
+    );
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -423,6 +444,8 @@ struct VulkanExternalSync {
     device: ash::Device,
     external_semaphore_fd: external_semaphore_fd::Device,
     semaphore: Option<vk::Semaphore>,
+    #[cfg(test)]
+    completion_probe: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -489,6 +512,10 @@ impl VulkanExternalSync {
 impl Drop for VulkanExternalSync {
     fn drop(&mut self) {
         self.destroy_semaphore();
+        #[cfg(test)]
+        if let Some(probe) = self.completion_probe.take() {
+            probe.store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 }
 
@@ -3069,7 +3096,7 @@ mod external_frame_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn unprepared_vulkan_frame_releases_its_lease() {
+    fn uninitialized_external_state_is_rejected() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let released = Arc::new(AtomicBool::new(false));
@@ -3078,7 +3105,7 @@ mod external_frame_tests {
             Ok(file) => file.into(),
             Err(error) => panic!("/dev/null should be available: {error}"),
         };
-        let frame = VulkanExternalFrame::new(
+        let result = super::VulkanExternalFrame::new(
             vk::Image::null(),
             wgpu::Extent3d {
                 width: 1,
@@ -3090,9 +3117,223 @@ mod external_frame_tests {
             sync_file,
             move || released_for_lease.store(true, Ordering::Release),
         );
+        let error = match result {
+            Ok(_) => panic!("UNINITIALIZED must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("initialized producer contents"));
+        assert!(released.load(Ordering::Acquire));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unprepared_vulkan_frame_releases_its_lease() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let released = Arc::new(AtomicBool::new(false));
+        let released_for_lease = Arc::clone(&released);
+        let sync_file = match std::fs::File::open("/dev/null") {
+            Ok(file) => file.into(),
+            Err(error) => panic!("/dev/null should be available: {error}"),
+        };
+        let frame = match VulkanExternalFrame::new(
+            vk::Image::null(),
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureUses::RESOURCE,
+            sync_file,
+            move || released_for_lease.store(true, Ordering::Release),
+        ) {
+            Ok(frame) => frame,
+            Err(error) => panic!("valid initialized frame should construct: {error}"),
+        };
 
         drop(frame);
         assert!(released.load(Ordering::Acquire));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod vulkan_external_frame_integration {
+    use super::{
+        EXTERNAL_SEMAPHORE_FD_EXTENSION, PreparedExternalFrame, VulkanExternalSync, WgpuContext,
+        classify_external_sync_error,
+    };
+    use ash::{khr::external_semaphore_fd, vk};
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    /// Run with `cargo test -p gpui_wgpu vulkan_external_frame_integration -- --nocapture`.
+    /// The test skips when the host has no Vulkan adapter or sync-fd support.
+    #[test]
+    fn sync_file_round_trip_uses_normal_wgpu_submits() -> anyhow::Result<()> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: None,
+        });
+        let adapter = match gpui::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        })) {
+            Ok(adapter) => adapter,
+            Err(error) => {
+                eprintln!("SKIP Vulkan external-frame integration: no Vulkan adapter: {error}");
+                return Ok(());
+            }
+        };
+        let required_limits = wgpu::Limits::downlevel_defaults()
+            .using_resolution(adapter.limits())
+            .using_alignment(adapter.limits());
+        let Some((device, queue)) = WgpuContext::create_vulkan_device_with_external_sync(
+            &adapter,
+            wgpu::Features::empty(),
+            &required_limits,
+        )?
+        else {
+            eprintln!(
+                "SKIP Vulkan external-frame integration: {EXTERNAL_SEMAPHORE_FD_EXTENSION:?} unsupported"
+            );
+            return Ok(());
+        };
+
+        // SAFETY: The device was created by the Vulkan HAL path above.
+        let Some(hal_device) = (unsafe { device.as_hal::<wgpu::hal::api::Vulkan>() }) else {
+            eprintln!("SKIP Vulkan external-frame integration: Vulkan HAL device unavailable");
+            return Ok(());
+        };
+        let raw_device = hal_device.raw_device().clone();
+        let external_semaphore_fd = external_semaphore_fd::Device::new(
+            hal_device.shared_instance().raw_instance(),
+            &raw_device,
+        );
+
+        let mut export_info = vk::ExportSemaphoreCreateInfo::default()
+            .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        let semaphore_info = vk::SemaphoreCreateInfo::default().push_next(&mut export_info);
+        // SAFETY: `raw_device` is the live Vulkan device created above and the create info
+        // requests a binary semaphore with the advertised sync-fd export handle type.
+        let signal_semaphore = unsafe { raw_device.create_semaphore(&semaphore_info, None) }?;
+
+        {
+            // SAFETY: The queue is the Vulkan queue created with `raw_device`.
+            let Some(hal_queue) = (unsafe { queue.as_hal::<wgpu::hal::api::Vulkan>() }) else {
+                eprintln!("SKIP Vulkan external-frame integration: Vulkan HAL queue unavailable");
+                return Ok(());
+            };
+            hal_queue.add_signal_semaphore(signal_semaphore, None);
+        }
+
+        let get_fd_info = vk::SemaphoreGetFdInfoKHR::default()
+            .semaphore(signal_semaphore)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        // SAFETY: The extension loader and export semaphore belong to `raw_device`.
+        let sync_fd = unsafe { external_semaphore_fd.get_semaphore_fd(&get_fd_info) }?;
+        // SAFETY: Vulkan returned ownership of this valid descriptor to the caller.
+        let sync_file = unsafe { OwnedFd::from_raw_fd(sync_fd) };
+
+        // This is the producer-side normal wgpu submission. It signals the export semaphore
+        // without bypassing wgpu's queue ordering.
+        queue.submit(std::iter::empty());
+        let signal_device = raw_device.clone();
+        queue.on_submitted_work_done(move || {
+            // SAFETY: This callback runs after the signal submission completed.
+            unsafe { signal_device.destroy_semaphore(signal_semaphore, None) };
+        });
+
+        let completed = Arc::new(AtomicBool::new(false));
+        let external_sync = VulkanExternalSync {
+            fd: Some(sync_file),
+            device: raw_device.clone(),
+            external_semaphore_fd: external_semaphore_fd::Device::new(
+                hal_device.shared_instance().raw_instance(),
+                &raw_device,
+            ),
+            semaphore: None,
+            completion_probe: Some(Arc::clone(&completed)),
+        };
+        {
+            // SAFETY: The queue is the Vulkan queue created with `raw_device`.
+            let Some(hal_queue) = (unsafe { queue.as_hal::<wgpu::hal::api::Vulkan>() }) else {
+                eprintln!("SKIP Vulkan external-frame integration: Vulkan HAL queue unavailable");
+                return Ok(());
+            };
+            let mut external_sync = external_sync;
+            external_sync
+                .import_and_wait(&hal_queue)
+                .map_err(|error| anyhow::anyhow!("importing exported sync fd: {error:?}"))?;
+
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("vulkan_external_frame_integration"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let mut prepared = PreparedExternalFrame {
+                external_sync: Some(external_sync),
+                texture: Arc::new(texture),
+            };
+
+            // This is the consumer-side normal wgpu submission. Its HAL wait is staged above.
+            queue.submit(std::iter::empty());
+            prepared.on_submitted(&queue);
+            assert!(prepared.external_sync.is_none());
+            drop(prepared);
+        }
+
+        let completed_for_callback = Arc::clone(&completed);
+        queue.on_submitted_work_done(move || {
+            completed_for_callback.store(true, Ordering::Release);
+        });
+        device.poll(wgpu::PollType::wait_indefinitely())?;
+        assert!(completed.load(Ordering::Acquire));
+
+        let invalid_file = std::fs::File::open("/dev/null")?;
+        let mut invalid_sync = VulkanExternalSync {
+            fd: Some(invalid_file.into()),
+            device: raw_device.clone(),
+            external_semaphore_fd: external_semaphore_fd::Device::new(
+                hal_device.shared_instance().raw_instance(),
+                &raw_device,
+            ),
+            semaphore: None,
+            completion_probe: None,
+        };
+        let invalid_error = {
+            // SAFETY: The queue is the Vulkan queue created with `raw_device`.
+            let Some(hal_queue) = (unsafe { queue.as_hal::<wgpu::hal::api::Vulkan>() }) else {
+                eprintln!("SKIP Vulkan external-frame integration: Vulkan HAL queue unavailable");
+                return Ok(());
+            };
+            match invalid_sync.import_and_wait(&hal_queue) {
+                Ok(()) => panic!("/dev/null must not import as a sync file"),
+                Err(error) => error,
+            }
+        };
+        assert_eq!(
+            classify_external_sync_error(invalid_error),
+            super::ExternalFrameOutcome::TransientFailure
+        );
+        Ok(())
     }
 }
 

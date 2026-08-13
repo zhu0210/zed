@@ -322,7 +322,7 @@ impl WgpuContext {
     }
 
     #[cfg(target_os = "linux")]
-    fn create_vulkan_device_with_external_sync(
+    pub(crate) fn create_vulkan_device_with_external_sync(
         adapter: &wgpu::Adapter,
         required_features: wgpu::Features,
         required_limits: &wgpu::Limits,
