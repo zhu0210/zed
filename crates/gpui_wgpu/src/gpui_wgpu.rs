@@ -11,3 +11,5 @@ pub use wgpu_renderer::{
     ExternalFrame, ExternalFrameAcquisition, ExternalFrameOutcome, GpuContext,
     PreparedExternalFrame, WgpuRenderer, WgpuSurfaceConfig,
 };
+#[cfg(target_os = "linux")]
+pub use wgpu_renderer::{ExternalFrameLease, VulkanExternalFrame};

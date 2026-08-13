@@ -6,6 +6,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use wgpu::TextureFormat;
 
+#[cfg(target_os = "linux")]
+use std::ffi::CStr;
+
+#[cfg(target_os = "linux")]
+const EXTERNAL_SEMAPHORE_FD_EXTENSION: &CStr = c"VK_KHR_external_semaphore_fd";
+
 pub struct WgpuContext {
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
@@ -267,6 +273,34 @@ impl WgpuContext {
             .using_resolution(adapter.limits())
             .using_alignment(adapter.limits());
 
+        let required_limits = wgpu::Limits::downlevel_defaults()
+            .using_resolution(adapter.limits())
+            .using_alignment(adapter.limits());
+
+        #[cfg(target_os = "linux")]
+        if adapter.get_info().backend == wgpu::Backend::Vulkan {
+            match Self::create_vulkan_device_with_external_sync(
+                adapter,
+                required_features,
+                &required_limits,
+            ) {
+                Ok(Some((device, queue))) => {
+                    return Ok((
+                        device,
+                        queue,
+                        dual_source_blending,
+                        color_atlas_texture_format,
+                    ));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    log::warn!(
+                        "Could not enable Vulkan external semaphore synchronization: {error:#}"
+                    );
+                }
+            }
+        }
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("gpui_device"),
@@ -285,6 +319,60 @@ impl WgpuContext {
             dual_source_blending,
             color_atlas_texture_format,
         ))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_vulkan_device_with_external_sync(
+        adapter: &wgpu::Adapter,
+        required_features: wgpu::Features,
+        required_limits: &wgpu::Limits,
+    ) -> anyhow::Result<Option<(wgpu::Device, wgpu::Queue)>> {
+        // SAFETY: The requested HAL API matches the backend reported by this adapter.
+        let Some(hal_adapter) = (unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }) else {
+            return Ok(None);
+        };
+
+        if !hal_adapter
+            .physical_device_capabilities()
+            .supports_extension(EXTERNAL_SEMAPHORE_FD_EXTENSION)
+        {
+            return Ok(None);
+        }
+
+        let callback: Box<wgpu::hal::vulkan::CreateDeviceCallback<'_>> = Box::new(|args| {
+            if !args.extensions.contains(&EXTERNAL_SEMAPHORE_FD_EXTENSION) {
+                args.extensions.push(EXTERNAL_SEMAPHORE_FD_EXTENSION);
+            }
+        });
+
+        // SAFETY: The HAL adapter is owned by the same wgpu adapter and the callback only
+        // enables an extension advertised by its physical device capabilities.
+        let hal_device = unsafe {
+            hal_adapter
+                .open_with_callback(
+                    required_features,
+                    required_limits,
+                    &wgpu::MemoryHints::MemoryUsage,
+                    Some(callback),
+                )
+                .map_err(|error| anyhow::anyhow!("opening Vulkan HAL device: {error:?}"))?
+        };
+
+        let descriptor = wgpu::DeviceDescriptor {
+            label: Some("gpui_device"),
+            required_features,
+            required_limits: required_limits.clone(),
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            trace: wgpu::Trace::Off,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        };
+
+        // SAFETY: `hal_device` was opened from this adapter and `descriptor` matches the
+        // features and limits used to open it.
+        let (device, queue) = unsafe { adapter.create_device_from_hal(hal_device, &descriptor) }
+            .map_err(|error| anyhow::anyhow!("creating Vulkan wgpu device: {error}"))?;
+
+        Ok(Some((device, queue)))
     }
 
     #[cfg(not(target_family = "wasm"))]

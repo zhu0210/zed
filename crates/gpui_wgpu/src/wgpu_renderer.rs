@@ -1,5 +1,7 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
+#[cfg(target_os = "linux")]
+use ash::{khr::external_semaphore_fd, vk};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
@@ -52,6 +54,11 @@ fn least_common_multiple(left: u64, right: u64) -> u64 {
     }
     left / first * right
 }
+
+#[cfg(target_os = "linux")]
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+#[cfg(target_os = "linux")]
+const EXTERNAL_SEMAPHORE_FD_EXTENSION: &std::ffi::CStr = c"VK_KHR_external_semaphore_fd";
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -167,25 +174,320 @@ impl ExternalFrameOutcome {
     }
 }
 
+#[cfg(target_os = "linux")]
+/// Callback invoked when wgpu releases an imported producer lease.
+pub type ExternalFrameLease = Box<dyn FnOnce() + Send + Sync + 'static>;
+
+#[cfg(target_os = "linux")]
+/// A producer-owned Vulkan image and its renderer-boundary acquire fence.
+pub struct VulkanExternalFrame {
+    image: vk::Image,
+    size: wgpu::Extent3d,
+    format: wgpu::TextureFormat,
+    initial_state: wgpu::TextureUses,
+    sync_file: Option<OwnedFd>,
+    lease: Option<ExternalFrameLease>,
+}
+
+#[cfg(target_os = "linux")]
+impl VulkanExternalFrame {
+    /// Describe an initialized producer image and take ownership of its sync
+    /// file descriptor until the renderer consumes it.
+    pub fn new(
+        image: vk::Image,
+        size: wgpu::Extent3d,
+        format: wgpu::TextureFormat,
+        initial_state: wgpu::TextureUses,
+        sync_file: OwnedFd,
+        lease: impl FnOnce() + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            image,
+            size,
+            format,
+            initial_state,
+            sync_file: Some(sync_file),
+            lease: Some(Box::new(lease)),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for VulkanExternalFrame {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            lease();
+        }
+    }
+}
+
 /// A frame prepared for submission by the renderer.
 ///
-/// This ticket only retains prepared and displayed texture state. GPU
-/// completion-based lease release belongs to the external-frame import and
-/// synchronization integration.
+/// Vulkan imports retain their acquire fence until the next draw submission
+/// and release their producer lease from the HAL texture drop callback.
 #[derive(Clone)]
 pub struct PreparedExternalFrame {
     texture: Arc<wgpu::Texture>,
+    #[cfg(target_os = "linux")]
+    external_sync: Option<Arc<Mutex<VulkanExternalSync>>>,
 }
 
 impl PreparedExternalFrame {
     /// Construct a frame from a texture created for the renderer's device.
     pub fn new(texture: Arc<wgpu::Texture>) -> Self {
-        Self { texture }
+        Self {
+            texture,
+            #[cfg(target_os = "linux")]
+            external_sync: None,
+        }
     }
 
     /// Return the texture sampled for this frame.
     pub fn texture(&self) -> &Arc<wgpu::Texture> {
         &self.texture
+    }
+
+    #[cfg(target_os = "linux")]
+    /// Import a producer-owned Vulkan image into the renderer's wgpu device.
+    ///
+    /// The sync file remains pending until the next normal renderer submit;
+    /// this lets the draw call stage the wait in wgpu's queue ordering.
+    pub fn from_vulkan(
+        context: &gpui::GpuContextHandle,
+        mut frame: VulkanExternalFrame,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            frame.image != vk::Image::null(),
+            "external image handle is null"
+        );
+        anyhow::ensure!(
+            frame.size.width != 0
+                && frame.size.height != 0
+                && frame.size.depth_or_array_layers == 1,
+            "external frame must be a non-empty 2D image"
+        );
+        if context.adapter.get_info().backend != wgpu::Backend::Vulkan {
+            anyhow::bail!("Vulkan external frames require a Vulkan adapter");
+        }
+
+        // SAFETY: the adapter and device come from the same wgpu context. The
+        // producer owns the image and promises that its descriptor and initial
+        // Vulkan layout match these values until wgpu releases the texture.
+        let hal_device = unsafe { context.device.as_hal::<wgpu::hal::api::Vulkan>() }
+            .ok_or_else(|| anyhow::anyhow!("Vulkan HAL device is unavailable"))?;
+        if !hal_device
+            .enabled_device_extensions()
+            .contains(&EXTERNAL_SEMAPHORE_FD_EXTENSION)
+        {
+            anyhow::bail!("Vulkan external semaphore fd extension is not enabled");
+        }
+
+        let raw_device = hal_device.raw_device().clone();
+        let external_semaphore_fd = external_semaphore_fd::Device::new(
+            hal_device.shared_instance().raw_instance(),
+            &raw_device,
+        );
+        let sync_file = frame
+            .sync_file
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("external frame sync file was already consumed"))?;
+        let external_sync = Arc::new(Mutex::new(VulkanExternalSync {
+            fd: Some(sync_file),
+            device: raw_device,
+            external_semaphore_fd,
+            semaphore: None,
+        }));
+
+        let texture_descriptor = wgpu::TextureDescriptor {
+            label: Some("external_frame"),
+            size: frame.size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: frame.format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        };
+        let hal_texture_descriptor = wgpu::hal::TextureDescriptor {
+            label: Some("external_frame"),
+            size: frame.size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: frame.format,
+            usage: wgpu::TextureUses::RESOURCE,
+            memory_flags: wgpu::hal::MemoryFlags::empty(),
+            view_formats: Vec::new(),
+        };
+        let lease = frame.lease.take();
+        // SAFETY: The producer keeps `frame.image` valid, and the HAL descriptor matches the
+        // image while the drop callback retains the producer lease.
+        let hal_texture = unsafe {
+            hal_device.texture_from_raw(
+                frame.image,
+                &hal_texture_descriptor,
+                Some(Box::new(move || {
+                    if let Some(lease) = lease {
+                        lease();
+                    }
+                })),
+                wgpu::hal::vulkan::TextureMemory::External,
+            )
+        };
+        // SAFETY: `hal_texture` came from this device and `frame.initial_state` is the
+        // producer-declared layout at the moment of wrapping.
+        let texture = unsafe {
+            context
+                .device
+                .create_texture_from_hal::<wgpu::hal::api::Vulkan>(
+                    hal_texture,
+                    &texture_descriptor,
+                    frame.initial_state,
+                )
+        };
+
+        Ok(Self {
+            texture: Arc::new(texture),
+            external_sync: Some(external_sync),
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn prepare_submission(&self, queue: &wgpu::Queue) -> Result<(), vk::Result> {
+        let Some(external_sync) = self.external_sync.as_ref() else {
+            return Ok(());
+        };
+
+        // SAFETY: The queue belongs to the same Vulkan device as the imported semaphore.
+        let Some(queue_hal) = (unsafe { queue.as_hal::<wgpu::hal::api::Vulkan>() }) else {
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        };
+        external_sync
+            .lock()
+            .map_err(|_| vk::Result::ERROR_DEVICE_LOST)?
+            .import_and_wait(&queue_hal)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn on_submitted(&self, queue: &wgpu::Queue) {
+        let Some(external_sync) = self.external_sync.as_ref() else {
+            return;
+        };
+        let external_sync = Arc::clone(external_sync);
+        queue.on_submitted_work_done(move || {
+            if let Ok(mut external_sync) = external_sync.lock() {
+                external_sync.destroy_semaphore();
+            }
+        });
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ExternalFrameState<PreparedExternalFrame> {
+    fn prepare_submission(&mut self, queue: &wgpu::Queue) -> ExternalFrameOutcome {
+        let Some(frame) = self.latest.as_ref() else {
+            return ExternalFrameOutcome::Accepted;
+        };
+
+        if let Err(error) = frame.prepare_submission(queue) {
+            self.latest = None;
+            return classify_external_sync_error(error);
+        }
+
+        ExternalFrameOutcome::Accepted
+    }
+
+    fn commit_after_submission_with_queue(&mut self, queue: &wgpu::Queue) {
+        if let Some(frame) = self.latest.take() {
+            frame.on_submitted(queue);
+            self.displayed = Some(frame);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn classify_external_sync_error(error: vk::Result) -> ExternalFrameOutcome {
+    match error {
+        vk::Result::ERROR_INITIALIZATION_FAILED
+        | vk::Result::ERROR_DEVICE_LOST
+        | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+        | vk::Result::ERROR_OUT_OF_HOST_MEMORY => ExternalFrameOutcome::FatalFailure,
+        _ => ExternalFrameOutcome::TransientFailure,
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct VulkanExternalSync {
+    fd: Option<OwnedFd>,
+    device: ash::Device,
+    external_semaphore_fd: external_semaphore_fd::Device,
+    semaphore: Option<vk::Semaphore>,
+}
+
+#[cfg(target_os = "linux")]
+impl VulkanExternalSync {
+    fn sync_file_import_info(
+        semaphore: vk::Semaphore,
+        fd: i32,
+    ) -> vk::ImportSemaphoreFdInfoKHR<'static> {
+        vk::ImportSemaphoreFdInfoKHR::default()
+            .semaphore(semaphore)
+            .flags(vk::SemaphoreImportFlags::TEMPORARY)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+            .fd(fd)
+    }
+
+    fn import_and_wait(&mut self, queue: &wgpu::hal::vulkan::Queue) -> Result<(), vk::Result> {
+        if self.semaphore.is_some() {
+            return Ok(());
+        }
+        let fd = self
+            .fd
+            .take()
+            .ok_or(vk::Result::ERROR_INVALID_EXTERNAL_HANDLE)?;
+        // SAFETY: `self.device` is the live Vulkan device associated with the HAL queue.
+        let semaphore = unsafe {
+            self.device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?
+        };
+        let fd = fd.into_raw_fd();
+        let import_info = Self::sync_file_import_info(semaphore, fd);
+        // SAFETY: The extension function and semaphore were obtained from `self.device`, and
+        // ownership of the valid raw fd is transferred to Vulkan by this import.
+        let import_result = unsafe { self.external_semaphore_fd.import_semaphore_fd(&import_info) };
+        if let Err(error) = import_result {
+            // Vulkan retains ownership of the fd only after a successful
+            // import. Reconstitute it on failure before destroying the empty
+            // semaphore.
+            // SAFETY: Import failed, so Vulkan did not take ownership of `fd`; `semaphore` was
+            // created above and has not been submitted.
+            unsafe {
+                drop(OwnedFd::from_raw_fd(fd));
+                self.device.destroy_semaphore(semaphore, None);
+            }
+            return Err(error);
+        }
+
+        queue.add_wait_semaphore(semaphore, None, vk::PipelineStageFlags::TOP_OF_PIPE);
+        self.semaphore = Some(semaphore);
+        Ok(())
+    }
+
+    fn destroy_semaphore(&mut self) {
+        if let Some(semaphore) = self.semaphore.take() {
+            // SAFETY: The semaphore is either not submitted yet or this method is called from
+            // the queue completion callback after its wait has finished.
+            unsafe {
+                self.device.destroy_semaphore(semaphore, None);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for VulkanExternalSync {
+    fn drop(&mut self) {
+        self.destroy_semaphore();
     }
 }
 
@@ -235,6 +537,7 @@ impl<T> ExternalFrameState<T> {
         outcome
     }
 
+    #[cfg(any(test, not(target_os = "linux")))]
     fn commit_after_submission(&mut self) {
         if let Some(frame) = self.latest.take() {
             self.displayed = Some(frame);
@@ -363,6 +666,7 @@ pub struct WgpuRenderer {
     surface_configured: bool,
     needs_redraw: bool,
     external_frames: ExternalFrameState<PreparedExternalFrame>,
+    last_external_frame_outcome: Option<ExternalFrameOutcome>,
 }
 
 impl WgpuRenderer {
@@ -407,13 +711,22 @@ impl WgpuRenderer {
             ExternalFrame::TransientFailure => (ExternalFrameAcquisition::TransientFailure, None),
             ExternalFrame::FatalFailure => (ExternalFrameAcquisition::FatalFailure, None),
         };
-        self.external_frames
-            .stage(self.adapter_info.backend, acquisition, frame)
+        let outcome = self
+            .external_frames
+            .stage(self.adapter_info.backend, acquisition, frame);
+        self.last_external_frame_outcome = Some(outcome);
+        outcome
     }
 
     /// Return the texture from the last accepted and presented external frame.
     pub fn displayed_external_frame(&self) -> Option<&PreparedExternalFrame> {
         self.external_frames.displayed()
+    }
+
+    /// Take the outcome from the most recent external-frame submission or
+    /// renderer-boundary synchronization attempt.
+    pub fn take_external_frame_outcome(&mut self) -> Option<ExternalFrameOutcome> {
+        self.last_external_frame_outcome.take()
     }
 
     /// Creates a new WgpuRenderer from raw window handles.
@@ -776,6 +1089,7 @@ impl WgpuRenderer {
             surface_configured: true,
             needs_redraw: false,
             external_frames: ExternalFrameState::default(),
+            last_external_frame_outcome: None,
         })
     }
 
@@ -1720,9 +2034,19 @@ impl WgpuRenderer {
             }
         }
 
-        self.resources()
-            .queue
-            .submit(std::iter::once(encoder.finish()));
+        let queue = Arc::clone(&self.resources().queue);
+        #[cfg(target_os = "linux")]
+        let external_outcome = self.external_frames.prepare_submission(&queue);
+        #[cfg(target_os = "linux")]
+        if external_outcome != ExternalFrameOutcome::Accepted {
+            self.last_external_frame_outcome = Some(external_outcome);
+        }
+
+        queue.submit(std::iter::once(encoder.finish()));
+        #[cfg(target_os = "linux")]
+        self.external_frames
+            .commit_after_submission_with_queue(&queue);
+        #[cfg(not(target_os = "linux"))]
         self.external_frames.commit_after_submission();
         Ok(())
     }
@@ -2565,6 +2889,12 @@ fn create_surface(
 #[cfg(test)]
 mod external_frame_tests {
     use super::{ExternalFrameAcquisition, ExternalFrameOutcome, ExternalFrameState};
+    #[cfg(target_os = "linux")]
+    use super::{VulkanExternalFrame, VulkanExternalSync, classify_external_sync_error};
+    #[cfg(target_os = "linux")]
+    use ash::vk;
+    #[cfg(target_os = "linux")]
+    use std::sync::Arc;
 
     #[test]
     fn external_frame_outcomes_are_classified_strictly() {
@@ -2708,6 +3038,60 @@ mod external_frame_tests {
 
         state.commit_after_submission();
         assert_eq!(state.displayed(), Some(&1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sync_file_import_uses_temporary_sync_fd_payload() {
+        let import_info = VulkanExternalSync::sync_file_import_info(vk::Semaphore::null(), 17);
+
+        assert_eq!(import_info.flags, vk::SemaphoreImportFlags::TEMPORARY);
+        assert_eq!(
+            import_info.handle_type,
+            vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD
+        );
+        assert_eq!(import_info.fd, 17);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sync_file_failures_preserve_recoverable_classification() {
+        assert_eq!(
+            classify_external_sync_error(vk::Result::ERROR_INVALID_EXTERNAL_HANDLE),
+            ExternalFrameOutcome::TransientFailure
+        );
+        assert_eq!(
+            classify_external_sync_error(vk::Result::ERROR_DEVICE_LOST),
+            ExternalFrameOutcome::FatalFailure
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unprepared_vulkan_frame_releases_its_lease() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let released = Arc::new(AtomicBool::new(false));
+        let released_for_lease = Arc::clone(&released);
+        let sync_file = match std::fs::File::open("/dev/null") {
+            Ok(file) => file.into(),
+            Err(error) => panic!("/dev/null should be available: {error}"),
+        };
+        let frame = VulkanExternalFrame::new(
+            vk::Image::null(),
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureUses::UNINITIALIZED,
+            sync_file,
+            move || released_for_lease.store(true, Ordering::Release),
+        );
+
+        drop(frame);
+        assert!(released.load(Ordering::Acquire));
     }
 }
 
