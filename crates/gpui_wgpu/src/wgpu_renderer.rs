@@ -169,8 +169,9 @@ impl ExternalFrameOutcome {
 
 /// A frame prepared for submission by the renderer.
 ///
-/// The texture is held by an `Arc` so an importer can keep the underlying
-/// texture lease alive until the frame is no longer displayed.
+/// This ticket only retains prepared and displayed texture state. GPU
+/// completion-based lease release belongs to the external-frame import and
+/// synchronization integration.
 #[derive(Clone)]
 pub struct PreparedExternalFrame {
     texture: Arc<wgpu::Texture>,
@@ -198,16 +199,6 @@ pub enum ExternalFrame {
     FatalFailure,
 }
 
-impl ExternalFrame {
-    fn acquisition(&self) -> ExternalFrameAcquisition {
-        match self {
-            Self::Prepared(_) => ExternalFrameAcquisition::Prepared,
-            Self::TransientFailure => ExternalFrameAcquisition::TransientFailure,
-            Self::FatalFailure => ExternalFrameAcquisition::FatalFailure,
-        }
-    }
-}
-
 struct ExternalFrameState<T> {
     latest: Option<T>,
     displayed: Option<T>,
@@ -223,15 +214,28 @@ impl<T> Default for ExternalFrameState<T> {
 }
 
 impl<T> ExternalFrameState<T> {
-    fn prepare(&mut self, frame: T) {
-        self.latest = Some(frame);
+    fn stage(
+        &mut self,
+        backend: wgpu::Backend,
+        acquisition: ExternalFrameAcquisition,
+        frame: Option<T>,
+    ) -> ExternalFrameOutcome {
+        let outcome = ExternalFrameOutcome::classify(backend, acquisition);
+        match outcome {
+            ExternalFrameOutcome::Accepted => {
+                if let Some(frame) = frame {
+                    self.latest = Some(frame);
+                }
+            }
+            ExternalFrameOutcome::TransientFailure | ExternalFrameOutcome::FatalFailure => {
+                self.latest = None;
+            }
+            ExternalFrameOutcome::Unsupported => {}
+        }
+        outcome
     }
 
-    fn reject_latest(&mut self) {
-        self.latest = None;
-    }
-
-    fn commit_latest(&mut self) {
+    fn commit_after_submission(&mut self) {
         if let Some(frame) = self.latest.take() {
             self.displayed = Some(frame);
         }
@@ -392,48 +396,19 @@ impl WgpuRenderer {
         })
     }
 
-    /// Submit the latest prepared external frame or report its acquisition
-    /// failure. Only Vulkan renderers accept this seam; other backends return
-    /// [`ExternalFrameOutcome::Unsupported`] without changing normal drawing.
+    /// Stage the latest prepared external frame or report its acquisition
+    /// failure. The displayed frame changes only when normal drawing reaches
+    /// a successful queue submission. Only Vulkan renderers accept this seam;
+    /// other backends return [`ExternalFrameOutcome::Unsupported`] without
+    /// changing normal drawing.
     pub fn submit_external_frame(&mut self, frame: ExternalFrame) -> ExternalFrameOutcome {
-        let outcome =
-            ExternalFrameOutcome::classify(self.adapter_info.backend, frame.acquisition());
-
-        if outcome == ExternalFrameOutcome::Accepted {
-            if let ExternalFrame::Prepared(frame) = frame {
-                self.external_frames.prepare(frame);
-            }
-        } else {
-            self.external_frames.reject_latest();
-        }
-
-        outcome
-    }
-
-    /// Draw the regular scene while committing an accepted external frame at
-    /// the same submission boundary.
-    ///
-    /// The external frame is committed only when the regular draw presents a
-    /// frame. If presentation fails, the previously displayed texture stays
-    /// active and the caller receives [`ExternalFrameOutcome::TransientFailure`].
-    pub fn draw_with_external_frame(
-        &mut self,
-        scene: &Scene,
-        frame: ExternalFrame,
-    ) -> (bool, ExternalFrameOutcome) {
-        let outcome = self.submit_external_frame(frame);
-        let presented = self.draw(scene);
-
-        if outcome == ExternalFrameOutcome::Accepted {
-            if presented {
-                self.external_frames.commit_latest();
-            } else {
-                self.external_frames.reject_latest();
-                return (false, ExternalFrameOutcome::TransientFailure);
-            }
-        }
-
-        (presented, outcome)
+        let (acquisition, frame) = match frame {
+            ExternalFrame::Prepared(frame) => (ExternalFrameAcquisition::Prepared, Some(frame)),
+            ExternalFrame::TransientFailure => (ExternalFrameAcquisition::TransientFailure, None),
+            ExternalFrame::FatalFailure => (ExternalFrameAcquisition::FatalFailure, None),
+        };
+        self.external_frames
+            .stage(self.adapter_info.backend, acquisition, frame)
     }
 
     /// Return the texture from the last accepted and presented external frame.
@@ -1748,6 +1723,7 @@ impl WgpuRenderer {
         self.resources()
             .queue
             .submit(std::iter::once(encoder.finish()));
+        self.external_frames.commit_after_submission();
         Ok(())
     }
 
@@ -2622,26 +2598,116 @@ mod external_frame_tests {
     #[test]
     fn external_frame_state_keeps_only_the_latest_prepared_frame() {
         let mut state = ExternalFrameState::default();
-        state.prepare(1);
-        state.prepare(2);
+        assert_eq!(
+            state.stage(
+                wgpu::Backend::Vulkan,
+                ExternalFrameAcquisition::Prepared,
+                Some(1),
+            ),
+            ExternalFrameOutcome::Accepted
+        );
+        assert_eq!(
+            state.stage(
+                wgpu::Backend::Vulkan,
+                ExternalFrameAcquisition::Prepared,
+                Some(2),
+            ),
+            ExternalFrameOutcome::Accepted
+        );
 
-        state.commit_latest();
+        state.commit_after_submission();
 
         assert_eq!(state.displayed(), Some(&2));
         assert_eq!(state.latest(), None);
     }
 
     #[test]
-    fn external_frame_acquisition_failure_preserves_previous_texture() {
+    fn external_frame_submission_and_failure_preserve_previous_texture() {
         let mut state = ExternalFrameState::default();
-        state.prepare(1);
-        state.commit_latest();
-        state.prepare(2);
+        state.stage(
+            wgpu::Backend::Vulkan,
+            ExternalFrameAcquisition::Prepared,
+            Some(1),
+        );
+        state.commit_after_submission();
+        state.stage(
+            wgpu::Backend::Vulkan,
+            ExternalFrameAcquisition::Prepared,
+            Some(2),
+        );
 
-        state.reject_latest();
+        assert_eq!(
+            state.stage(
+                wgpu::Backend::Vulkan,
+                ExternalFrameAcquisition::TransientFailure,
+                None,
+            ),
+            ExternalFrameOutcome::TransientFailure
+        );
+        state.commit_after_submission();
+        assert_eq!(state.displayed(), Some(&1));
+
+        state.stage(
+            wgpu::Backend::Vulkan,
+            ExternalFrameAcquisition::Prepared,
+            Some(2),
+        );
+        assert_eq!(
+            state.stage(
+                wgpu::Backend::Vulkan,
+                ExternalFrameAcquisition::FatalFailure,
+                None,
+            ),
+            ExternalFrameOutcome::FatalFailure
+        );
+        state.commit_after_submission();
 
         assert_eq!(state.displayed(), Some(&1));
         assert_eq!(state.latest(), None);
+    }
+
+    #[test]
+    fn unsubmitted_external_frame_does_not_replace_previous_texture() {
+        let mut state = ExternalFrameState::default();
+        state.stage(
+            wgpu::Backend::Vulkan,
+            ExternalFrameAcquisition::Prepared,
+            Some(1),
+        );
+        state.commit_after_submission();
+        state.stage(
+            wgpu::Backend::Vulkan,
+            ExternalFrameAcquisition::Prepared,
+            Some(2),
+        );
+
+        assert_eq!(state.displayed(), Some(&1));
+    }
+
+    #[test]
+    fn unsupported_backend_does_not_change_external_frame_state() {
+        let mut state = ExternalFrameState::default();
+        state.stage(
+            wgpu::Backend::Vulkan,
+            ExternalFrameAcquisition::Prepared,
+            Some(1),
+        );
+
+        for acquisition in [
+            ExternalFrameAcquisition::Prepared,
+            ExternalFrameAcquisition::TransientFailure,
+            ExternalFrameAcquisition::FatalFailure,
+        ] {
+            assert_eq!(
+                state.stage(wgpu::Backend::Gl, acquisition, Some(2)),
+                ExternalFrameOutcome::Unsupported
+            );
+            assert_eq!(state.latest(), Some(&1));
+            assert_eq!(state.displayed(), None);
+        }
+
+        state.commit_after_submission();
+        assert_eq!(state.displayed(), Some(&1));
     }
 }
 
