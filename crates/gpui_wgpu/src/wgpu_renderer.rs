@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use crate::wgpu_context::{EXTERNAL_SEMAPHORE_FD_EXTENSION, QUEUE_FAMILY_FOREIGN_EXTENSION};
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 #[cfg(target_os = "linux")]
@@ -57,11 +59,7 @@ fn least_common_multiple(left: u64, right: u64) -> u64 {
 
 #[cfg(target_os = "linux")]
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
-#[cfg(target_os = "linux")]
-const EXTERNAL_SEMAPHORE_FD_EXTENSION: &std::ffi::CStr = c"VK_KHR_external_semaphore_fd";
 
-#[cfg(target_os = "linux")]
-const QUEUE_FAMILY_FOREIGN_EXTENSION: &std::ffi::CStr = c"VK_EXT_queue_family_foreign";
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -178,8 +176,7 @@ impl ExternalFrameOutcome {
 }
 
 #[cfg(target_os = "linux")]
-/// Callback invoked when wgpu releases an imported producer lease.
-pub type ExternalFrameLease = Box<dyn FnOnce() + Send + Sync + 'static>;
+type ExternalFrameLease = Box<dyn FnOnce() + Send + Sync + 'static>;
 
 #[cfg(target_os = "linux")]
 /// Queue-family ownership held by the producer of an external Vulkan image.
@@ -221,11 +218,20 @@ impl VulkanExternalFrame {
     ///
     /// # Safety
     ///
-    /// The caller must ensure that `image` was created on the Vulkan device used
-    /// by [`PreparedExternalFrame::from_vulkan`], matches `size`, `format`, and
-    /// `initial_state`, is currently owned by `ownership`, and remains valid
-    /// until the lease callback runs. The producer must also have completed its
-    /// release barrier and signaled `sync_file` before the frame is consumed.
+    /// The caller must ensure all of the following:
+    ///
+    /// - `image` was created on the Vulkan device used by
+    ///   [`PreparedExternalFrame::from_vulkan`].
+    /// - The image is a 2D image with one mip level, one array layer, one sample,
+    ///   and a format and extent matching `format` and `size`.
+    /// - The image was created with `VK_IMAGE_USAGE_SAMPLED_BIT`, matching the
+    ///   imported wgpu texture's `TEXTURE_BINDING` usage.
+    /// - Its current layout is the concrete initialized layout described by
+    ///   `initial_state`, and it is currently owned by `ownership`.
+    /// - The image and its backing memory remain valid until the lease callback
+    ///   runs.
+    /// - The producer completed its release barrier and signaled `sync_file`
+    ///   before the frame is consumed.
     pub unsafe fn new(
         image: vk::Image,
         size: wgpu::Extent3d,
@@ -3318,10 +3324,6 @@ mod vulkan_external_frame_integration {
             }
         }
 
-        fn destroy_after_poll(&mut self) {
-            self.destroy_handles();
-        }
-
         fn destroy_handles(&mut self) {
             if let Some(signal_semaphore) = self.signal_semaphore.take() {
                 // SAFETY: The caller waits until both the raw producer and normal consumer
@@ -3780,7 +3782,7 @@ mod vulkan_external_frame_integration {
         assert!(completion_probe.load(Ordering::Acquire));
         assert!(submission_completed.load(Ordering::Acquire));
         assert!(fallback_drop_probe.load(Ordering::Acquire));
-        producer_resources.destroy_after_poll();
+        producer_resources.destroy_handles();
 
         let invalid_file = std::fs::File::open("/dev/null")?;
         let mut invalid_sync = VulkanExternalSync {

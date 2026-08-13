@@ -10,10 +10,10 @@ use wgpu::TextureFormat;
 use std::ffi::CStr;
 
 #[cfg(target_os = "linux")]
-const EXTERNAL_SEMAPHORE_FD_EXTENSION: &CStr = c"VK_KHR_external_semaphore_fd";
+pub(crate) const EXTERNAL_SEMAPHORE_FD_EXTENSION: &CStr = c"VK_KHR_external_semaphore_fd";
 
 #[cfg(target_os = "linux")]
-const QUEUE_FAMILY_FOREIGN_EXTENSION: &CStr = c"VK_EXT_queue_family_foreign";
+pub(crate) const QUEUE_FAMILY_FOREIGN_EXTENSION: &CStr = c"VK_EXT_queue_family_foreign";
 
 pub struct WgpuContext {
     pub instance: wgpu::Instance,
