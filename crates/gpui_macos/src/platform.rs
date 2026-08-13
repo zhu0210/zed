@@ -1493,7 +1493,11 @@ fn import_via_iosurface(
     let wgpu_texture = unsafe {
         gpu_handle
             .device
-            .create_texture_from_hal::<wgpu::hal::api::Metal>(hal_texture, &texture_desc)
+            .create_texture_from_hal::<wgpu::hal::api::Metal>(
+                hal_texture,
+                &texture_desc,
+                wgpu::TextureUses::RESOURCE,
+            )
     };
 
     log::info!(
