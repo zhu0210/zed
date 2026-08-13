@@ -231,7 +231,6 @@ impl VulkanExternalFrame {
         size: wgpu::Extent3d,
         format: wgpu::TextureFormat,
         initial_state: wgpu::TextureUses,
-        // The producer queue family that released the image to the renderer.
         ownership: ExternalOwnership,
         sync_file: OwnedFd,
         lease: impl FnOnce() + Send + Sync + 'static,
@@ -3315,6 +3314,98 @@ mod vulkan_external_frame_integration {
         atomic::{AtomicBool, Ordering},
     };
 
+    struct ProducerResources {
+        device: ash::Device,
+        signal_semaphore: Option<vk::Semaphore>,
+        command_pool: Option<vk::CommandPool>,
+    }
+
+    impl ProducerResources {
+        fn new(device: ash::Device, command_pool: vk::CommandPool) -> Self {
+            Self {
+                device,
+                signal_semaphore: None,
+                command_pool: Some(command_pool),
+            }
+        }
+
+        fn destroy_after_poll(&mut self) {
+            self.destroy_handles();
+        }
+
+        fn destroy_handles(&mut self) {
+            if let Some(signal_semaphore) = self.signal_semaphore.take() {
+                // SAFETY: The caller waits until both the raw producer and normal consumer
+                // submissions are complete before destroying the semaphore.
+                unsafe {
+                    self.device.destroy_semaphore(signal_semaphore, None);
+                }
+            }
+            if let Some(command_pool) = self.command_pool.take() {
+                // SAFETY: The caller waits until the raw producer command buffer is complete
+                // before destroying the command pool that owns it.
+                unsafe {
+                    self.device.destroy_command_pool(command_pool, None);
+                }
+            }
+        }
+    }
+
+    impl Drop for ProducerResources {
+        fn drop(&mut self) {
+            if self.signal_semaphore.is_none() && self.command_pool.is_none() {
+                return;
+            }
+            // SAFETY: This test-only cleanup guard is used only after all Vulkan handles were
+            // created on `device`; waiting for idle prevents an early destroy on error paths.
+            if let Err(error) = unsafe { self.device.device_wait_idle() } {
+                eprintln!("Vulkan producer cleanup wait failed: {error:?}");
+            }
+            self.destroy_handles();
+        }
+    }
+
+    struct ProducerImageResources {
+        device: ash::Device,
+        image: vk::Image,
+        memory: vk::DeviceMemory,
+        handed_to_hal: bool,
+    }
+
+    impl ProducerImageResources {
+        fn new(device: ash::Device, image: vk::Image, memory: vk::DeviceMemory) -> Self {
+            Self {
+                device,
+                image,
+                memory,
+                handed_to_hal: false,
+            }
+        }
+
+        fn hand_to_hal(&mut self) -> (vk::Image, vk::DeviceMemory) {
+            self.handed_to_hal = true;
+            (self.image, self.memory)
+        }
+    }
+
+    impl Drop for ProducerImageResources {
+        fn drop(&mut self) {
+            if self.handed_to_hal {
+                return;
+            }
+            // SAFETY: This test-only cleanup guard waits for any producer work before releasing
+            // the image and its bound memory on an early-return path.
+            if let Err(error) = unsafe { self.device.device_wait_idle() } {
+                eprintln!("Vulkan image cleanup wait failed: {error:?}");
+            }
+            // SAFETY: The image and memory were created by `device` and are not owned by HAL.
+            unsafe {
+                self.device.destroy_image(self.image, None);
+                self.device.free_memory(self.memory, None);
+            }
+        }
+    }
+
     /// Run with `cargo test -p gpui_wgpu vulkan_external_frame_integration -- --nocapture`.
     /// The test skips when the host has no Vulkan adapter or sync-fd support.
     #[test]
@@ -3371,6 +3462,7 @@ mod vulkan_external_frame_integration {
             .queue_family_index(queue_family);
         // SAFETY: `raw_device` owns the queue family used by `raw_queue`.
         let command_pool = unsafe { raw_device.create_command_pool(&command_pool_info, None) }?;
+        let mut producer_resources = ProducerResources::new(raw_device.clone(), command_pool);
         let command_buffer_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
@@ -3390,6 +3482,7 @@ mod vulkan_external_frame_integration {
         // SAFETY: `raw_device` is the live Vulkan device created above and the create info
         // requests a binary semaphore with the advertised sync-fd export handle type.
         let signal_semaphore = unsafe { raw_device.create_semaphore(&semaphore_info, None) }?;
+        producer_resources.signal_semaphore = Some(signal_semaphore);
 
         let subresource_range = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -3482,6 +3575,11 @@ mod vulkan_external_frame_integration {
                 }
                 return Err(error.into());
             }
+            let mut image_resources = ProducerImageResources::new(
+                raw_device.clone(),
+                external_image,
+                external_memory,
+            );
 
             // SAFETY: The image is bound and the command buffer is recording on its owning queue.
             unsafe {
@@ -3551,14 +3649,6 @@ mod vulkan_external_frame_integration {
             // SAFETY: Vulkan returned ownership of this valid descriptor to the caller.
             let sync_file = unsafe { OwnedFd::from_raw_fd(sync_fd) };
 
-            let signal_device = raw_device.clone();
-            queue.on_submitted_work_done(move || {
-                // SAFETY: This callback runs after the signal submission completed.
-                unsafe { signal_device.destroy_semaphore(signal_semaphore, None) };
-                // SAFETY: The producer command buffer completed before this callback.
-                unsafe { signal_device.destroy_command_pool(command_pool, None) };
-            });
-
             let external_sync = VulkanExternalSync {
                 fd: Some(sync_file),
                 device: raw_device.clone(),
@@ -3572,6 +3662,7 @@ mod vulkan_external_frame_integration {
 
             let lease_probe = Arc::clone(&fallback_drop_probe);
             let image_device = raw_device.clone();
+            let (external_image, external_memory) = image_resources.hand_to_hal();
             // SAFETY: The image is owned by this test until wgpu releases the imported texture;
             // the callback then destroys the exact image handle created above.
             let hal_texture = unsafe {
@@ -3606,14 +3697,20 @@ mod vulkan_external_frame_integration {
             let external_view = prepared
                 .texture
                 .create_view(&wgpu::TextureViewDescriptor::default());
+            let result_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("vulkan_external_frame_integration_sample_result"),
+                size: 16,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
             let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("vulkan_external_frame_integration_sample"),
                 source: wgpu::ShaderSource::Wgsl(
                     "@group(0) @binding(0) var input_texture: texture_2d<f32>;\n\
+                     @group(0) @binding(1) var<storage, read_write> result: array<vec4<f32>>;\n\
                      @compute @workgroup_size(1)\n\
                      fn main() {\n\
-                         if (textureLoad(input_texture, vec2<i32>(0, 0), 0).r < -1.0) {\n\
-                         }\n\
+                         result[0] = textureLoad(input_texture, vec2<i32>(0, 0), 0);\n\
                      }"
                     .into(),
                 ),
@@ -3629,10 +3726,16 @@ mod vulkan_external_frame_integration {
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("vulkan_external_frame_integration_sample"),
                 layout: &pipeline.get_bind_group_layout(0),
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&external_view),
-                }],
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&external_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: result_buffer.as_entire_binding(),
+                    },
+                ],
             });
 
             // Keep raw ownership recording separate from the normal consumer encoder. Both
@@ -3685,6 +3788,7 @@ mod vulkan_external_frame_integration {
         assert!(completion_probe.load(Ordering::Acquire));
         assert!(submission_completed.load(Ordering::Acquire));
         assert!(fallback_drop_probe.load(Ordering::Acquire));
+        producer_resources.destroy_after_poll();
 
         let invalid_file = std::fs::File::open("/dev/null")?;
         let mut invalid_sync = VulkanExternalSync {
