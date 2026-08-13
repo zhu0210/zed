@@ -179,12 +179,34 @@ impl ExternalFrameOutcome {
 pub type ExternalFrameLease = Box<dyn FnOnce() + Send + Sync + 'static>;
 
 #[cfg(target_os = "linux")]
+/// Queue-family ownership held by the producer of an external Vulkan image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VulkanExternalFrameOwnership {
+    /// The image is released from a Vulkan external queue family.
+    External,
+    /// The image is released from a foreign queue family through
+    /// `VK_EXT_QUEUE_FAMILY_FOREIGN`.
+    Foreign,
+}
+
+#[cfg(target_os = "linux")]
+impl VulkanExternalFrameOwnership {
+    fn queue_family(self) -> u32 {
+        match self {
+            Self::External => vk::QUEUE_FAMILY_EXTERNAL,
+            Self::Foreign => vk::QUEUE_FAMILY_FOREIGN_EXT,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 /// A producer-owned Vulkan image and its renderer-boundary acquire fence.
 pub struct VulkanExternalFrame {
     image: vk::Image,
     size: wgpu::Extent3d,
     format: wgpu::TextureFormat,
     initial_state: wgpu::TextureUses,
+    ownership: VulkanExternalFrameOwnership,
     sync_file: Option<OwnedFd>,
     lease: Option<ExternalFrameLease>,
 }
@@ -194,14 +216,13 @@ impl VulkanExternalFrame {
     /// Describe an initialized producer image and take ownership of its sync
     /// file descriptor until the renderer consumes it.
     ///
-    /// The producer must have completed any Vulkan queue-family ownership
-    /// transfer before constructing this descriptor. wgpu 30 cannot encode
-    /// that transfer through its public HAL transition API.
     pub fn new(
         image: vk::Image,
         size: wgpu::Extent3d,
         format: wgpu::TextureFormat,
         initial_state: wgpu::TextureUses,
+        // The producer queue family that released the image to the renderer.
+        ownership: VulkanExternalFrameOwnership,
         sync_file: OwnedFd,
         lease: impl FnOnce() + Send + Sync + 'static,
     ) -> anyhow::Result<Self> {
@@ -215,6 +236,7 @@ impl VulkanExternalFrame {
             size,
             format,
             initial_state,
+            ownership,
             sync_file: Some(sync_file),
             lease: Some(lease),
         })
@@ -238,6 +260,10 @@ pub struct PreparedExternalFrame {
     #[cfg(target_os = "linux")]
     // Drop the Vulkan sync object before the texture's device reference.
     external_sync: Option<VulkanExternalSync>,
+    #[cfg(target_os = "linux")]
+    initial_state: wgpu::TextureUses,
+    #[cfg(target_os = "linux")]
+    ownership: VulkanExternalFrameOwnership,
     texture: Arc<wgpu::Texture>,
 }
 
@@ -247,6 +273,10 @@ impl PreparedExternalFrame {
         Self {
             #[cfg(target_os = "linux")]
             external_sync: None,
+            #[cfg(target_os = "linux")]
+            initial_state: wgpu::TextureUses::RESOURCE,
+            #[cfg(target_os = "linux")]
+            ownership: VulkanExternalFrameOwnership::External,
             texture,
         }
     }
@@ -261,13 +291,6 @@ impl PreparedExternalFrame {
     ///
     /// The sync file remains pending until the next normal renderer submit;
     /// this lets the draw call stage the wait in wgpu's queue ordering.
-    /// The producer must have completed any Vulkan queue-family ownership
-    /// transfer before calling this function. wgpu 30's
-    /// `create_texture_from_hal` tracks only `TextureUses` layout/state; its
-    /// Vulkan `transition_textures` path has no queue-family fields. See the
-    /// pinned wgpu sources at `wgpu/src/api/device.rs:323-338`,
-    /// `wgpu-hal/src/lib.rs:1452-1454`, and
-    /// `wgpu-hal/src/vulkan/command.rs:235-260`.
     pub fn from_vulkan(
         context: &gpui::GpuContextHandle,
         mut frame: VulkanExternalFrame,
@@ -367,6 +390,8 @@ impl PreparedExternalFrame {
 
         Ok(Self {
             external_sync: Some(external_sync),
+            initial_state: frame.initial_state,
+            ownership: frame.ownership,
             texture: Arc::new(texture),
         })
     }
@@ -381,7 +406,43 @@ impl PreparedExternalFrame {
         let Some(queue_hal) = (unsafe { queue.as_hal::<wgpu::hal::api::Vulkan>() }) else {
             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
         };
-        external_sync.import_and_wait(&queue_hal)
+        external_sync.import(&queue_hal)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn acquire_ownership(&self, encoder: &mut wgpu::CommandEncoder) -> Result<(), ()> {
+        if self.external_sync.is_none() {
+            return Ok(());
+        }
+        let Some(texture) = (unsafe { self.texture.as_hal::<wgpu::hal::api::Vulkan>() }) else {
+            return Err(());
+        };
+        let range = wgpu::ImageSubresourceRange {
+            aspect: wgpu::TextureAspect::All,
+            base_mip_level: 0,
+            mip_level_count: Some(1),
+            base_array_layer: 0,
+            array_layer_count: Some(1),
+        };
+        let mut acquired = false;
+        // SAFETY: `texture` and `encoder` are from the same Vulkan wgpu device; the encoder is
+        // recording outside a render pass, and the descriptor records the producer's exact
+        // initialized layout and external queue-family ownership.
+        unsafe {
+            encoder.as_hal_mut::<wgpu::hal::api::Vulkan, _, _>(|hal_encoder| {
+                let Some(hal_encoder) = hal_encoder else {
+                    return;
+                };
+                hal_encoder.acquire_external_texture_ownership(
+                    &texture,
+                    &range,
+                    self.initial_state,
+                    self.ownership.queue_family(),
+                );
+                acquired = true;
+            });
+        }
+        acquired.then_some(()).ok_or(())
     }
 
     #[cfg(target_os = "linux")]
@@ -410,6 +471,18 @@ impl ExternalFrameState<PreparedExternalFrame> {
         ExternalFrameOutcome::Accepted
     }
 
+    #[cfg(target_os = "linux")]
+    fn acquire_ownership(&mut self, encoder: &mut wgpu::CommandEncoder) -> ExternalFrameOutcome {
+        let Some(frame) = self.latest.as_ref() else {
+            return ExternalFrameOutcome::Accepted;
+        };
+        if frame.acquire_ownership(encoder).is_err() {
+            self.latest = None;
+            return ExternalFrameOutcome::FatalFailure;
+        }
+        ExternalFrameOutcome::Accepted
+    }
+
     fn commit_after_submission_with_queue(&mut self, queue: &wgpu::Queue) {
         if let Some(mut frame) = self.latest.take() {
             frame.on_submitted(queue);
@@ -423,6 +496,15 @@ fn ensure_external_frame_initial_state(initial_state: wgpu::TextureUses) -> anyh
     anyhow::ensure!(
         !initial_state.contains(wgpu::TextureUses::UNINITIALIZED),
         "external frame initial state must describe initialized producer contents"
+    );
+    anyhow::ensure!(
+        !initial_state.is_empty()
+            && !initial_state.intersects(
+                wgpu::TextureUses::COMPLEX
+                    | wgpu::TextureUses::UNKNOWN
+                    | wgpu::TextureUses::TRANSIENT,
+            ),
+        "external frame initial state must be a concrete texture usage"
     );
     Ok(())
 }
@@ -461,7 +543,7 @@ impl VulkanExternalSync {
             .fd(fd)
     }
 
-    fn import_and_wait(&mut self, queue: &wgpu::hal::vulkan::Queue) -> Result<(), vk::Result> {
+    fn import(&mut self, queue: &wgpu::hal::vulkan::Queue) -> Result<(), vk::Result> {
         if self.semaphore.is_some() {
             return Ok(());
         }
@@ -1930,6 +2012,9 @@ impl WgpuRenderer {
     }
 
     fn record_frame(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> Result<()> {
+        let queue = Arc::clone(&self.resources().queue);
+        #[cfg(target_os = "linux")]
+        let mut external_outcome = self.external_frames.prepare_submission(&queue);
         let mut instance_offset = 0;
         let instance_bindings = self
             .write_instances(scene, &mut instance_offset)
@@ -1952,6 +2037,11 @@ impl WgpuRenderer {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("main_encoder"),
                 });
+
+        #[cfg(target_os = "linux")]
+        if external_outcome == ExternalFrameOutcome::Accepted {
+            external_outcome = self.external_frames.acquire_ownership(&mut encoder);
+        }
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2062,9 +2152,6 @@ impl WgpuRenderer {
             }
         }
 
-        let queue = Arc::clone(&self.resources().queue);
-        #[cfg(target_os = "linux")]
-        let external_outcome = self.external_frames.prepare_submission(&queue);
         #[cfg(target_os = "linux")]
         if external_outcome != ExternalFrameOutcome::Accepted {
             self.last_external_frame_outcome = Some(external_outcome);
@@ -2197,24 +2284,24 @@ impl WgpuRenderer {
                         texture.create_view(&wgpu::TextureViewDescriptor::default());
                     let bind_group = resources.device.create_bind_group(
                         &wgpu::BindGroupDescriptor {
-                            label: Some("surface_rgba_bind_group"),
-                            layout: &resources.bind_group_layouts.instances_with_texture,
-                            entries: &[
-                                wgpu::BindGroupEntry {
-                                    binding: 0,
-                                    resource: self.instance_binding(offset, size),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 1,
-                                    resource: wgpu::BindingResource::TextureView(&view),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 2,
-                                    resource: wgpu::BindingResource::Sampler(
-                                        &resources.atlas_sampler,
-                                    ),
-                                },
-                            ],
+                                label: Some("surface_rgba_bind_group"),
+                                layout: &resources.bind_group_layouts.instances_with_texture,
+                                entries: &[
+                                    wgpu::BindGroupEntry {
+                                        binding: 0,
+                                        resource: self.instance_binding(offset, size),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 1,
+                                        resource: wgpu::BindingResource::TextureView(&view),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 2,
+                                        resource: wgpu::BindingResource::Sampler(
+                                            &resources.atlas_sampler,
+                                        ),
+                                    },
+                                ],
                         },
                     );
 
@@ -2918,7 +3005,10 @@ fn create_surface(
 mod external_frame_tests {
     use super::{ExternalFrameAcquisition, ExternalFrameOutcome, ExternalFrameState};
     #[cfg(target_os = "linux")]
-    use super::{VulkanExternalFrame, VulkanExternalSync, classify_external_sync_error};
+    use super::{
+        VulkanExternalFrame, VulkanExternalFrameOwnership, VulkanExternalSync,
+        classify_external_sync_error,
+    };
     #[cfg(target_os = "linux")]
     use ash::vk;
     #[cfg(target_os = "linux")]
@@ -3070,6 +3160,19 @@ mod external_frame_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn ownership_family_mapping_is_restricted_to_external_families() {
+        assert_eq!(
+            VulkanExternalFrameOwnership::External.queue_family(),
+            vk::QUEUE_FAMILY_EXTERNAL
+        );
+        assert_eq!(
+            VulkanExternalFrameOwnership::Foreign.queue_family(),
+            vk::QUEUE_FAMILY_FOREIGN_EXT
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn sync_file_import_uses_temporary_sync_fd_payload() {
         let import_info = VulkanExternalSync::sync_file_import_info(vk::Semaphore::null(), 17);
 
@@ -3114,6 +3217,7 @@ mod external_frame_tests {
             },
             wgpu::TextureFormat::Rgba8Unorm,
             wgpu::TextureUses::UNINITIALIZED,
+            VulkanExternalFrameOwnership::External,
             sync_file,
             move || released_for_lease.store(true, Ordering::Release),
         );
@@ -3145,6 +3249,7 @@ mod external_frame_tests {
             },
             wgpu::TextureFormat::Rgba8Unorm,
             wgpu::TextureUses::RESOURCE,
+            VulkanExternalFrameOwnership::Foreign,
             sync_file,
             move || released_for_lease.store(true, Ordering::Release),
         ) {
@@ -3160,8 +3265,8 @@ mod external_frame_tests {
 #[cfg(all(test, target_os = "linux"))]
 mod vulkan_external_frame_integration {
     use super::{
-        EXTERNAL_SEMAPHORE_FD_EXTENSION, PreparedExternalFrame, VulkanExternalSync, WgpuContext,
-        classify_external_sync_error,
+        EXTERNAL_SEMAPHORE_FD_EXTENSION, PreparedExternalFrame, VulkanExternalFrameOwnership,
+        VulkanExternalSync, WgpuContext, classify_external_sync_error,
     };
     use ash::{khr::external_semaphore_fd, vk};
     use std::os::fd::{FromRawFd, OwnedFd};
@@ -3235,6 +3340,10 @@ mod vulkan_external_frame_integration {
             hal_queue.add_signal_semaphore(signal_semaphore, None);
         }
 
+        // This is the producer-side normal wgpu submission. It signals the export semaphore
+        // without bypassing wgpu's queue ordering.
+        queue.submit(std::iter::empty());
+
         let get_fd_info = vk::SemaphoreGetFdInfoKHR::default()
             .semaphore(signal_semaphore)
             .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
@@ -3243,16 +3352,13 @@ mod vulkan_external_frame_integration {
         // SAFETY: Vulkan returned ownership of this valid descriptor to the caller.
         let sync_file = unsafe { OwnedFd::from_raw_fd(sync_fd) };
 
-        // This is the producer-side normal wgpu submission. It signals the export semaphore
-        // without bypassing wgpu's queue ordering.
-        queue.submit(std::iter::empty());
         let signal_device = raw_device.clone();
         queue.on_submitted_work_done(move || {
             // SAFETY: This callback runs after the signal submission completed.
             unsafe { signal_device.destroy_semaphore(signal_semaphore, None) };
         });
 
-        let completed = Arc::new(AtomicBool::new(false));
+        let sync_released = Arc::new(AtomicBool::new(false));
         let external_sync = VulkanExternalSync {
             fd: Some(sync_file),
             device: raw_device.clone(),
@@ -3261,7 +3367,7 @@ mod vulkan_external_frame_integration {
                 &raw_device,
             ),
             semaphore: None,
-            completion_probe: Some(Arc::clone(&completed)),
+            completion_probe: Some(Arc::clone(&sync_released)),
         };
         {
             // SAFETY: The queue is the Vulkan queue created with `raw_device`.
@@ -3271,10 +3377,10 @@ mod vulkan_external_frame_integration {
             };
             let mut external_sync = external_sync;
             external_sync
-                .import_and_wait(&hal_queue)
+                .import(&hal_queue)
                 .map_err(|error| anyhow::anyhow!("importing exported sync fd: {error:?}"))?;
 
-            let texture = device.create_texture(&wgpu::TextureDescriptor {
+            let texture_descriptor = wgpu::TextureDescriptor {
                 label: Some("vulkan_external_frame_integration"),
                 size: wgpu::Extent3d {
                     width: 1,
@@ -3285,27 +3391,136 @@ mod vulkan_external_frame_integration {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::COPY_DST,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
-            });
+            };
+            let hal_texture_descriptor = wgpu::hal::TextureDescriptor {
+                label: Some("vulkan_external_frame_integration"),
+                size: texture_descriptor.size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: texture_descriptor.format,
+                usage: wgpu::TextureUses::RESOURCE,
+                memory_flags: wgpu::hal::MemoryFlags::empty(),
+                view_formats: Vec::new(),
+            };
+            let image_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .extent(vk::Extent3D {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::SAMPLED)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
+            // SAFETY: `raw_device` is the live Vulkan device used by the wgpu HAL device.
+            let external_image = unsafe { raw_device.create_image(&image_info, None) }?;
+            let memory_requirements =
+                unsafe { raw_device.get_image_memory_requirements(external_image) };
+            let memory_properties = unsafe {
+                hal_device
+                    .shared_instance()
+                    .raw_instance()
+                    .get_physical_device_memory_properties(hal_device.raw_physical_device())
+            };
+            let Some(memory_type_index) = (0..memory_properties.memory_type_count).find(|index| {
+                memory_requirements.memory_type_bits & (1 << index) != 0
+                    && memory_properties
+                        .memory_types
+                        .get(*index as usize)
+                        .is_some_and(|memory_type| {
+                            memory_type
+                                .property_flags
+                                .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                        })
+            }) else {
+                // SAFETY: The image was created by this device and has not been handed to wgpu.
+                unsafe { raw_device.destroy_image(external_image, None) };
+                anyhow::bail!("no device-local memory type supports the integration image");
+            };
+            let memory_info = vk::MemoryAllocateInfo::default()
+                .allocation_size(memory_requirements.size)
+                .memory_type_index(memory_type_index);
+            // SAFETY: The allocation uses a memory type advertised for this image.
+            let external_memory = unsafe { raw_device.allocate_memory(&memory_info, None) }?;
+            // SAFETY: The image and memory were created by the same Vulkan device and the
+            // allocation satisfies the image's memory requirements.
+            if let Err(error) =
+                unsafe { raw_device.bind_image_memory(external_image, external_memory, 0) }
+            {
+                // SAFETY: Neither handle has been handed to wgpu because binding failed.
+                unsafe {
+                    raw_device.free_memory(external_memory, None);
+                    raw_device.destroy_image(external_image, None);
+                }
+                return Err(error.into());
+            }
+            let lease_released = Arc::new(AtomicBool::new(false));
+            let lease_probe = Arc::clone(&lease_released);
+            let image_device = raw_device.clone();
+            // SAFETY: The image is owned by this test until wgpu releases the imported texture;
+            // the callback then destroys the exact image handle created above.
+            let hal_texture = unsafe {
+                hal_device.texture_from_raw(
+                    external_image,
+                    &hal_texture_descriptor,
+                    Some(Box::new(move || {
+                        lease_probe.store(true, Ordering::Release);
+                        // SAFETY: wgpu has finished using the image before invoking this drop
+                        // callback, and this callback owns the image handle.
+                        image_device.destroy_image(external_image, None);
+                        image_device.free_memory(external_memory, None);
+                    })),
+                    wgpu::hal::vulkan::TextureMemory::External,
+                )
+            };
+            // SAFETY: `hal_texture` was created by this device and remains alive in `texture`.
+            let texture = unsafe {
+                device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(
+                    hal_texture,
+                    &texture_descriptor,
+                    wgpu::TextureUses::RESOURCE,
+                )
+            };
             let mut prepared = PreparedExternalFrame {
                 external_sync: Some(external_sync),
+                initial_state: wgpu::TextureUses::RESOURCE,
+                ownership: VulkanExternalFrameOwnership::External,
                 texture: Arc::new(texture),
             };
 
-            // This is the consumer-side normal wgpu submission. Its HAL wait is staged above.
-            queue.submit(std::iter::empty());
+            // This is the consumer-side normal wgpu submission. Its HAL wait and ownership
+            // acquire are submitted together through wgpu's queue ordering.
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("vulkan_external_frame_integration_consumer"),
+            });
+            assert_eq!(
+                prepared.acquire_ownership(&mut encoder),
+                Ok(()),
+                "Vulkan ownership acquire must use the live external texture"
+            );
+            queue.submit(std::iter::once(encoder.finish()));
             prepared.on_submitted(&queue);
             assert!(prepared.external_sync.is_none());
             drop(prepared);
+            assert!(lease_released.load(Ordering::Acquire));
         }
 
-        let completed_for_callback = Arc::clone(&completed);
+        let submission_completed = Arc::new(AtomicBool::new(false));
+        let completed_for_callback = Arc::clone(&submission_completed);
         queue.on_submitted_work_done(move || {
             completed_for_callback.store(true, Ordering::Release);
         });
         device.poll(wgpu::PollType::wait_indefinitely())?;
-        assert!(completed.load(Ordering::Acquire));
+        assert!(sync_released.load(Ordering::Acquire));
+        assert!(submission_completed.load(Ordering::Acquire));
 
         let invalid_file = std::fs::File::open("/dev/null")?;
         let mut invalid_sync = VulkanExternalSync {
@@ -3324,7 +3539,7 @@ mod vulkan_external_frame_integration {
                 eprintln!("SKIP Vulkan external-frame integration: Vulkan HAL queue unavailable");
                 return Ok(());
             };
-            match invalid_sync.import_and_wait(&hal_queue) {
+            match invalid_sync.import(&hal_queue) {
                 Ok(()) => panic!("/dev/null must not import as a sync file"),
                 Err(error) => error,
             }
