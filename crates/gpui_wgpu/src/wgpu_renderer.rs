@@ -589,7 +589,7 @@ impl WgpuRenderer {
         }));
 
         let resources = WgpuResources {
-            device: device.clone(),
+            device,
             queue,
             surface,
             pipelines,
