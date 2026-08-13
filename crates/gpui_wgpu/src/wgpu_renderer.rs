@@ -2285,9 +2285,7 @@ impl WgpuRenderer {
 
         for surface in surfaces {
             // Skip zero-sized surfaces (collapsed panels, hidden elements).
-            if surface.bounds.size.width.0 <= 0.0
-                || surface.bounds.size.height.0 <= 0.0
-            {
+            if surface.bounds.size.width.0 <= 0.0 || surface.bounds.size.height.0 <= 0.0 {
                 continue;
             }
 
@@ -2305,16 +2303,16 @@ impl WgpuRenderer {
                             std::mem::size_of::<SurfaceInstance>(),
                         )
                     };
-                    let Some((offset, size)) =
-                        self.write_to_instance_buffer(instance_offset, data)
+                    let Some((offset, size)) = self.write_to_instance_buffer(instance_offset, data)
                     else {
                         return false;
                     };
 
-                    let view =
-                        texture.create_view(&wgpu::TextureViewDescriptor::default());
-                    let bind_group = resources.device.create_bind_group(
-                        &wgpu::BindGroupDescriptor {
+                    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                    let bind_group =
+                        resources
+                            .device
+                            .create_bind_group(&wgpu::BindGroupDescriptor {
                                 label: Some("surface_rgba_bind_group"),
                                 layout: &resources.bind_group_layouts.instances_with_texture,
                                 entries: &[
@@ -2333,8 +2331,7 @@ impl WgpuRenderer {
                                         ),
                                     },
                                 ],
-                        },
-                    );
+                            });
 
                     let scissor_rect = (
                         surface.content_mask.bounds.origin.x.0.max(0.0) as u32,
@@ -2367,10 +2364,9 @@ impl WgpuRenderer {
                         )
                     };
 
-                    let y_view =
-                        y_texture.create_view(&wgpu::TextureViewDescriptor::default());
-                    let cb_cr_view = cb_cr_texture
-                        .create_view(&wgpu::TextureViewDescriptor::default());
+                    let y_view = y_texture.create_view(&wgpu::TextureViewDescriptor::default());
+                    let cb_cr_view =
+                        cb_cr_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
                     nv12_items.push(Nv12Data {
                         y_view,
@@ -2417,18 +2413,19 @@ impl WgpuRenderer {
         let mut nv12_draws: Vec<Nv12Draw> = Vec::with_capacity(nv12_items.len());
 
         for item in nv12_items {
-            let uniform_buffer = resources.device.create_buffer(
-                &wgpu::BufferDescriptor {
-                    label: Some("surface_nv12_uniform"),
-                    size: std::mem::size_of::<SurfaceParams>() as u64,
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                },
-            );
-            resources.queue.write_buffer(&uniform_buffer, 0, &item.params_data);
+            let uniform_buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("surface_nv12_uniform"),
+                size: std::mem::size_of::<SurfaceParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            resources
+                .queue
+                .write_buffer(&uniform_buffer, 0, &item.params_data);
 
-            let bind_group = resources.device.create_bind_group(
-                &wgpu::BindGroupDescriptor {
+            let bind_group = resources
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("surface_nv12_bind_group"),
                     layout: &resources.bind_group_layouts.surfaces,
                     entries: &[
@@ -2438,25 +2435,18 @@ impl WgpuRenderer {
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
-                            resource: wgpu::BindingResource::TextureView(
-                                &item.y_view,
-                            ),
+                            resource: wgpu::BindingResource::TextureView(&item.y_view),
                         },
                         wgpu::BindGroupEntry {
                             binding: 2,
-                            resource: wgpu::BindingResource::TextureView(
-                                &item.cb_cr_view,
-                            ),
+                            resource: wgpu::BindingResource::TextureView(&item.cb_cr_view),
                         },
                         wgpu::BindGroupEntry {
                             binding: 3,
-                            resource: wgpu::BindingResource::Sampler(
-                                &resources.atlas_sampler,
-                            ),
+                            resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
                         },
                     ],
-                },
-            );
+                });
 
             nv12_draws.push(Nv12Draw {
                 bind_group,
@@ -3037,8 +3027,7 @@ mod external_frame_tests {
     use super::{ExternalFrameAcquisition, ExternalFrameOutcome, ExternalFrameState};
     #[cfg(target_os = "linux")]
     use super::{
-        ExternalOwnership, VulkanExternalFrame, VulkanExternalSync,
-        classify_external_sync_error,
+        ExternalOwnership, VulkanExternalFrame, VulkanExternalSync, classify_external_sync_error,
     };
     #[cfg(target_os = "linux")]
     use ash::vk;
@@ -3562,7 +3551,15 @@ mod vulkan_external_frame_integration {
                 .allocation_size(memory_requirements.size)
                 .memory_type_index(memory_type_index);
             // SAFETY: The allocation uses a memory type advertised for this image.
-            let external_memory = unsafe { raw_device.allocate_memory(&memory_info, None) }?;
+            let external_memory = match unsafe { raw_device.allocate_memory(&memory_info, None) } {
+                Ok(memory) => memory,
+                Err(error) => {
+                    // SAFETY: The image was created by this device and has not been handed to
+                    // wgpu because its memory allocation failed.
+                    unsafe { raw_device.destroy_image(external_image, None) };
+                    return Err(error.into());
+                }
+            };
             // SAFETY: The image and memory were created by the same Vulkan device and the
             // allocation satisfies the image's memory requirements.
             if let Err(error) =
@@ -3575,11 +3572,8 @@ mod vulkan_external_frame_integration {
                 }
                 return Err(error.into());
             }
-            let mut image_resources = ProducerImageResources::new(
-                raw_device.clone(),
-                external_image,
-                external_memory,
-            );
+            let mut image_resources =
+                ProducerImageResources::new(raw_device.clone(), external_image, external_memory);
 
             // SAFETY: The image is bound and the command buffer is recording on its owning queue.
             unsafe {
@@ -3740,16 +3734,14 @@ mod vulkan_external_frame_integration {
 
             // Keep raw ownership recording separate from the normal consumer encoder. Both
             // command buffers are submitted together through the normal wgpu queue.
-            let mut ownership_encoder = device.create_command_encoder(
-                &wgpu::CommandEncoderDescriptor {
+            let mut ownership_encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("vulkan_external_frame_integration_ownership"),
-                },
-            );
-            let mut consumer_encoder = device.create_command_encoder(
-                &wgpu::CommandEncoderDescriptor {
+                });
+            let mut consumer_encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("vulkan_external_frame_integration_consumer"),
-                },
-            );
+                });
             assert_eq!(
                 prepared.encode_ownership(&mut ownership_encoder),
                 Ok(()),
