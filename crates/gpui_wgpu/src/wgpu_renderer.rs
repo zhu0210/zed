@@ -227,18 +227,19 @@ impl Drop for VulkanExternalFrame {
 /// and release their producer lease from the HAL texture drop callback.
 #[derive(Clone)]
 pub struct PreparedExternalFrame {
-    texture: Arc<wgpu::Texture>,
     #[cfg(target_os = "linux")]
+    // Drop the Vulkan sync object before the texture's device reference.
     external_sync: Option<Arc<Mutex<VulkanExternalSync>>>,
+    texture: Arc<wgpu::Texture>,
 }
 
 impl PreparedExternalFrame {
     /// Construct a frame from a texture created for the renderer's device.
     pub fn new(texture: Arc<wgpu::Texture>) -> Self {
         Self {
-            texture,
             #[cfg(target_os = "linux")]
             external_sync: None,
+            texture,
         }
     }
 
@@ -347,8 +348,8 @@ impl PreparedExternalFrame {
         };
 
         Ok(Self {
-            texture: Arc::new(texture),
             external_sync: Some(external_sync),
+            texture: Arc::new(texture),
         })
     }
 
