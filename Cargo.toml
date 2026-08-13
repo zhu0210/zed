@@ -900,7 +900,7 @@ wax = "0.7"
 web-time = "1.1.0"
 webpki-roots = "1.0.8"
 webrtc-sys = "0.3.23"
-wgpu = { git = "https://github.com/zhu0210/wgpu.git", rev = "b544e9c58" }
+wgpu = { git = "https://github.com/zhu0210/wgpu.git", rev = "b544e9c585d91f5548f96577f3f547e920e38fd5" }
 which = "8"
 windows-core = "0.62"
 windows-registry = "0.6.0"

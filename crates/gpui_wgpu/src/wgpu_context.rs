@@ -12,6 +12,9 @@ use std::ffi::CStr;
 #[cfg(target_os = "linux")]
 const EXTERNAL_SEMAPHORE_FD_EXTENSION: &CStr = c"VK_KHR_external_semaphore_fd";
 
+#[cfg(target_os = "linux")]
+const QUEUE_FAMILY_FOREIGN_EXTENSION: &CStr = c"VK_EXT_queue_family_foreign";
+
 pub struct WgpuContext {
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
@@ -339,9 +342,16 @@ impl WgpuContext {
             return Ok(None);
         }
 
-        let callback: Box<wgpu::hal::vulkan::CreateDeviceCallback<'_>> = Box::new(|args| {
+        let supports_foreign = hal_adapter
+            .physical_device_capabilities()
+            .supports_extension(QUEUE_FAMILY_FOREIGN_EXTENSION);
+
+        let callback: Box<wgpu::hal::vulkan::CreateDeviceCallback<'_>> = Box::new(move |args| {
             if !args.extensions.contains(&EXTERNAL_SEMAPHORE_FD_EXTENSION) {
                 args.extensions.push(EXTERNAL_SEMAPHORE_FD_EXTENSION);
+            }
+            if supports_foreign && !args.extensions.contains(&QUEUE_FAMILY_FOREIGN_EXTENSION) {
+                args.extensions.push(QUEUE_FAMILY_FOREIGN_EXTENSION);
             }
         });
 
