@@ -9,6 +9,33 @@ use refineable::Refineable;
 #[cfg(feature = "wgpu")]
 use std::sync::Arc;
 
+/// Color conversion applied to sampled NV12 values.
+///
+/// The input vector is ordered as `[Y, Cb, Cr, 1]`, matching the values
+/// sampled by the NV12 shader. `yuv_to_rgb[column][row]` stores one column of
+/// the matrix, which is the column-major layout expected by WGSL's
+/// `mat4x4<f32>` and its `matrix * vector` multiplication. The fourth column
+/// therefore contains the additive offsets, including the `-0.5` chroma
+/// centering used by the default conversion.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Nv12ColorTransform {
+    /// Column-major YUV-to-RGB matrix for an input `[Y, Cb, Cr, 1]` vector.
+    pub yuv_to_rgb: [[f32; 4]; 4],
+}
+
+impl Default for Nv12ColorTransform {
+    fn default() -> Self {
+        Self {
+            yuv_to_rgb: [
+                [1.0000, 1.0000, 1.0000, 0.0],
+                [0.0000, -0.3441, 1.7720, 0.0],
+                [1.4020, -0.7141, 0.0000, 0.0],
+                [-0.7010, 0.5291, -0.8860, 1.0],
+            ],
+        }
+    }
+}
+
 /// Source content for a [`Surface`] element.
 #[derive(Clone)]
 pub enum SurfaceSource {
@@ -30,6 +57,15 @@ pub enum SurfaceSource {
         y_texture: Arc<wgpu::Texture>,
         cb_cr_texture: Arc<wgpu::Texture>,
         native_size: Size<DevicePixels>,
+    },
+    /// Two-plane NV12 wgpu texture with an explicit color transform.
+    #[cfg(feature = "wgpu")]
+    #[expect(missing_docs)]
+    Nv12TextureWithColorTransform {
+        y_texture: Arc<wgpu::Texture>,
+        cb_cr_texture: Arc<wgpu::Texture>,
+        native_size: Size<DevicePixels>,
+        color_transform: Nv12ColorTransform,
     },
 }
 
@@ -83,6 +119,32 @@ impl From<(Arc<wgpu::Texture>, Arc<wgpu::Texture>, Size<DevicePixels>)> for Surf
             y_texture,
             cb_cr_texture,
             native_size,
+        }
+    }
+}
+
+#[cfg(feature = "wgpu")]
+impl
+    From<(
+        Arc<wgpu::Texture>,
+        Arc<wgpu::Texture>,
+        Size<DevicePixels>,
+        Nv12ColorTransform,
+    )> for SurfaceSource
+{
+    fn from(
+        (y_texture, cb_cr_texture, native_size, color_transform): (
+            Arc<wgpu::Texture>,
+            Arc<wgpu::Texture>,
+            Size<DevicePixels>,
+            Nv12ColorTransform,
+        ),
+    ) -> Self {
+        SurfaceSource::Nv12TextureWithColorTransform {
+            y_texture,
+            cb_cr_texture,
+            native_size,
+            color_transform,
         }
     }
 }
@@ -182,7 +244,8 @@ impl Element for Surface {
                 }
             }
             #[cfg(feature = "wgpu")]
-            SurfaceSource::Nv12Texture { native_size, .. } => {
+            SurfaceSource::Nv12Texture { native_size, .. }
+            | SurfaceSource::Nv12TextureWithColorTransform { native_size, .. } => {
                 if native_size.height.0 > 0 {
                     style.aspect_ratio =
                         Some(native_size.width.0 as f32 / native_size.height.0 as f32);
@@ -292,6 +355,28 @@ impl Element for Surface {
                             y_texture.clone(),
                             cb_cr_texture.clone(),
                             *native_size,
+                        );
+                    }
+                    #[cfg(feature = "wgpu")]
+                    SurfaceSource::Nv12TextureWithColorTransform {
+                        y_texture,
+                        cb_cr_texture,
+                        native_size,
+                        color_transform,
+                    } => {
+                        let paint_bounds = self.object_fit.get_bounds(bounds, *native_size);
+                        eprintln!(
+                            "NV12 paint: layout_bounds={:?}×{:?}, native={:?}×{:?}, paint_bounds={:?}×{:?}",
+                            bounds.origin, bounds.size,
+                            native_size.width, native_size.height,
+                            paint_bounds.origin, paint_bounds.size,
+                        );
+                        window.paint_surface_with_nv12_texture_with_color_transform(
+                            paint_bounds,
+                            y_texture.clone(),
+                            cb_cr_texture.clone(),
+                            *native_size,
+                            *color_transform,
                         );
                     }
                     #[allow(unreachable_patterns)]

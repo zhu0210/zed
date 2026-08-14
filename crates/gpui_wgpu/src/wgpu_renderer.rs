@@ -90,6 +90,21 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+    yuv_to_rgb: [[f32; 4]; 4],
+}
+
+impl SurfaceParams {
+    fn new(
+        bounds: PodBounds,
+        content_mask: PodBounds,
+        transform: gpui::Nv12ColorTransform,
+    ) -> Self {
+        Self {
+            bounds,
+            content_mask,
+            yuv_to_rgb: transform.yuv_to_rgb,
+        }
+    }
 }
 
 #[repr(C)]
@@ -2354,15 +2369,32 @@ impl WgpuRenderer {
                     // write_to_instance_buffer already advanced instance_offset
                     // to the next aligned position; do not add extra offset here.
                 }
-                gpui::SurfaceContent::WgpuTextureNv12 {
-                    y_texture,
-                    cb_cr_texture,
-                    ..
-                } => {
-                    let params = SurfaceParams {
-                        bounds: surface.bounds.into(),
-                        content_mask: surface.content_mask.bounds.into(),
+                gpui::SurfaceContent::WgpuTextureNv12 { .. }
+                | gpui::SurfaceContent::WgpuTextureNv12WithColorTransform { .. } => {
+                    let (y_texture, cb_cr_texture, color_transform) = match &surface.content {
+                        gpui::SurfaceContent::WgpuTextureNv12 {
+                            y_texture,
+                            cb_cr_texture,
+                            ..
+                        } => (
+                            y_texture,
+                            cb_cr_texture,
+                            gpui::Nv12ColorTransform::default(),
+                        ),
+                        gpui::SurfaceContent::WgpuTextureNv12WithColorTransform {
+                            y_texture,
+                            cb_cr_texture,
+                            color_transform,
+                            ..
+                        } => (y_texture, cb_cr_texture, *color_transform),
+                        #[allow(unreachable_patterns)]
+                        _ => continue,
                     };
+                    let params = SurfaceParams::new(
+                        surface.bounds.into(),
+                        surface.content_mask.bounds.into(),
+                        color_transform,
+                    );
                     let params_data = unsafe {
                         std::slice::from_raw_parts(
                             &params as *const SurfaceParams as *const u8,
@@ -3900,5 +3932,64 @@ mod tests {
         assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);
         assert_eq!(std::mem::size_of::<SubpixelSprite>(), 28 * 4);
         assert_eq!(std::mem::size_of::<PolychromeSprite>(), 24 * 4);
+    }
+
+    #[test]
+    fn nv12_tuple_apis_are_available_without_gpu_resources() {
+        fn assert_into_surface_source<T: Into<gpui::SurfaceSource>>() {}
+
+        assert_into_surface_source::<(
+            Arc<wgpu::Texture>,
+            Arc<wgpu::Texture>,
+            gpui::Size<gpui::DevicePixels>,
+        )>();
+        assert_into_surface_source::<(
+            Arc<wgpu::Texture>,
+            Arc<wgpu::Texture>,
+            gpui::Size<gpui::DevicePixels>,
+            gpui::Nv12ColorTransform,
+        )>();
+    }
+
+    #[test]
+    fn nv12_params_preserve_default_and_column_major_matrix_layout() {
+        assert_eq!(
+            gpui::Nv12ColorTransform::default().yuv_to_rgb,
+            [
+                [1.0000, 1.0000, 1.0000, 0.0],
+                [0.0000, -0.3441, 1.7720, 0.0],
+                [1.4020, -0.7141, 0.0000, 0.0],
+                [-0.7010, 0.5291, -0.8860, 1.0],
+            ]
+        );
+
+        let transform = gpui::Nv12ColorTransform {
+            yuv_to_rgb: [
+                [0.0, 1.0, 2.0, 3.0],
+                [4.0, 5.0, 6.0, 7.0],
+                [8.0, 9.0, 10.0, 11.0],
+                [12.0, 13.0, 14.0, 15.0],
+            ],
+        };
+        let params = SurfaceParams::new(
+            PodBounds {
+                origin: [0.0; 2],
+                size: [0.0; 2],
+            },
+            PodBounds {
+                origin: [0.0; 2],
+                size: [0.0; 2],
+            },
+            transform,
+        );
+
+        assert_eq!(params.yuv_to_rgb, transform.yuv_to_rgb);
+        assert_eq!(
+            bytemuck::bytes_of(&params).get(32..96),
+            Some(bytemuck::bytes_of(&transform.yuv_to_rgb))
+        );
+        assert!(
+            include_str!("shaders.wgsl").contains("return surface_locals.yuv_to_rgb * y_cb_cr;")
+        );
     }
 }

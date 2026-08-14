@@ -5,8 +5,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, DevicePixels, Edges,
-    Hsla, Pixels, Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla,
+    Pixels, Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
     fmt::Debug,
@@ -783,6 +783,15 @@ pub enum SurfaceContent {
         y_texture: Arc<wgpu::Texture>,
         cb_cr_texture: Arc<wgpu::Texture>,
         native_size: Size<DevicePixels>,
+    },
+    /// Cross-platform NV12 wgpu texture with an explicit color transform.
+    #[cfg(feature = "wgpu")]
+    #[expect(missing_docs)]
+    WgpuTextureNv12WithColorTransform {
+        y_texture: Arc<wgpu::Texture>,
+        cb_cr_texture: Arc<wgpu::Texture>,
+        native_size: Size<DevicePixels>,
+        color_transform: crate::Nv12ColorTransform,
     },
 }
 

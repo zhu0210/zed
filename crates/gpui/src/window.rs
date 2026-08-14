@@ -6,6 +6,8 @@ use crate::Inspector;
 use crate::profiler;
 #[cfg(feature = "wgpu")]
 use crate::GpuContextHandle;
+#[cfg(any(feature = "inspector", debug_assertions))]
+use crate::Inspector;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
@@ -4846,6 +4848,34 @@ impl Window {
                 y_texture,
                 cb_cr_texture,
                 native_size,
+            },
+        });
+    }
+
+    /// Paint an NV12 texture using an explicit YUV-to-RGB color transform.
+    #[cfg(feature = "wgpu")]
+    pub(crate) fn paint_surface_with_nv12_texture_with_color_transform(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        y_texture: Arc<wgpu::Texture>,
+        cb_cr_texture: Arc<wgpu::Texture>,
+        native_size: Size<DevicePixels>,
+        color_transform: crate::Nv12ColorTransform,
+    ) {
+        use crate::{PaintSurface, SurfaceContent};
+
+        self.invalidator.debug_assert_paint();
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            content: SurfaceContent::WgpuTextureNv12WithColorTransform {
+                y_texture,
+                cb_cr_texture,
+                native_size,
+                color_transform,
             },
         });
     }
