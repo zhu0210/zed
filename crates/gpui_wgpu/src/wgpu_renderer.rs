@@ -6,9 +6,11 @@ use anyhow::{Context as _, Result};
 use ash::{khr::external_semaphore_fd, vk};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
+    AtlasTextureId, Background, Bounds, DevicePixels, ExternalFrameAcquisition, ExternalFrameOutcome, GpuSpecs, Path, Point, PrimitiveBatch,
     ScaledPixels, Scene, Size, get_gamma_correction_ratios,
 };
+#[cfg(target_os = "linux")]
+use gpui::{ExternalFrameRequest, ExternalNv12Frame, ExternalOwnership};
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -107,6 +109,24 @@ impl SurfaceParams {
     }
 }
 
+fn nv12_plane_view_descriptor(
+    aspect: wgpu::TextureAspect,
+) -> Option<wgpu::TextureViewDescriptor<'static>> {
+    let (format, label) = match aspect {
+        wgpu::TextureAspect::Plane0 => (wgpu::TextureFormat::R8Unorm, "nv12_plane_0"),
+        wgpu::TextureAspect::Plane1 => (wgpu::TextureFormat::Rg8Unorm, "nv12_plane_1"),
+        _ => return None,
+    };
+    Some(wgpu::TextureViewDescriptor {
+        label: Some(label),
+        format: Some(format),
+        dimension: Some(wgpu::TextureViewDimension::D2),
+        usage: Some(wgpu::TextureUsages::TEXTURE_BINDING),
+        aspect,
+        ..Default::default()
+    })
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct SurfaceInstance {
@@ -151,66 +171,14 @@ pub struct WgpuSurfaceConfig {
     pub preferred_present_mode: Option<wgpu::PresentMode>,
 }
 
-/// The result of trying to acquire an external frame.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExternalFrameAcquisition {
-    /// A frame was prepared and can be submitted.
-    Prepared,
-    /// The frame was not ready this tick, but the stream may recover.
-    TransientFailure,
-    /// The stream cannot recover without intervention.
-    FatalFailure,
-}
-
-/// The result reported after an external frame reaches the renderer seam.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExternalFrameOutcome {
-    /// The frame was accepted by the renderer.
-    Accepted,
-    /// The active renderer backend cannot accept external frames.
-    Unsupported,
-    /// The frame was not accepted for a recoverable reason.
-    TransientFailure,
-    /// The frame was not accepted for an unrecoverable reason.
-    FatalFailure,
-}
-
-impl ExternalFrameOutcome {
-    /// Classify an acquisition result for a renderer backend.
-    pub fn classify(backend: wgpu::Backend, acquisition: ExternalFrameAcquisition) -> Self {
-        if backend != wgpu::Backend::Vulkan {
-            return Self::Unsupported;
-        }
-
-        match acquisition {
-            ExternalFrameAcquisition::Prepared => Self::Accepted,
-            ExternalFrameAcquisition::TransientFailure => Self::TransientFailure,
-            ExternalFrameAcquisition::FatalFailure => Self::FatalFailure,
-        }
-    }
-}
-
 #[cfg(target_os = "linux")]
 type ExternalFrameLease = Box<dyn FnOnce() + Send + Sync + 'static>;
 
 #[cfg(target_os = "linux")]
-/// Queue-family ownership held by the producer of an external Vulkan image.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExternalOwnership {
-    /// The image is released from a Vulkan external queue family.
-    External,
-    /// The image is released from a foreign queue family through
-    /// `VK_EXT_QUEUE_FAMILY_FOREIGN`.
-    Foreign,
-}
-
-#[cfg(target_os = "linux")]
-impl ExternalOwnership {
-    fn queue_family(self) -> u32 {
-        match self {
-            Self::External => vk::QUEUE_FAMILY_EXTERNAL,
-            Self::Foreign => vk::QUEUE_FAMILY_FOREIGN_EXT,
-        }
+fn queue_family(ownership: ExternalOwnership) -> u32 {
+    match ownership {
+        ExternalOwnership::External => vk::QUEUE_FAMILY_EXTERNAL,
+        ExternalOwnership::Foreign => vk::QUEUE_FAMILY_FOREIGN_EXT,
     }
 }
 
@@ -241,8 +209,9 @@ impl VulkanExternalFrame {
     ///   and a format and extent matching `format` and `size`.
     /// - The image was created with `VK_IMAGE_USAGE_SAMPLED_BIT`, matching the
     ///   imported wgpu texture's `TEXTURE_BINDING` usage.
-    /// - Its current layout is the concrete initialized layout described by
-    ///   `initial_state`, and it is currently owned by `ownership`.
+    /// - Its actual Vulkan layout is `GENERAL`, it is currently owned by
+    ///   `ownership`, and `initial_state` is the concrete wgpu-tracked
+    ///   consumer state established after the acquire transition.
     /// - The image and its backing memory remain valid until the lease callback
     ///   runs.
     /// - The producer completed its release barrier and signaled `sync_file`
@@ -413,8 +382,8 @@ impl PreparedExternalFrame {
                 wgpu::hal::vulkan::TextureMemory::External,
             )
         };
-        // SAFETY: `hal_texture` came from this device and `frame.initial_state` is the
-        // producer-declared layout at the moment of wrapping.
+        // SAFETY: `hal_texture` came from this device and `frame.initial_state` is the concrete
+        // wgpu-tracked consumer state established after the external GENERAL-layout acquire.
         let texture = unsafe {
             context
                 .device
@@ -434,7 +403,65 @@ impl PreparedExternalFrame {
     }
 
     #[cfg(target_os = "linux")]
-    fn prepare_submission(&mut self, queue: &wgpu::Queue) -> Result<(), vk::Result> {
+    fn from_external_nv12(
+        context: &gpui::GpuContextHandle,
+        frame: ExternalNv12Frame,
+    ) -> Result<Self, ExternalFrameOutcome> {
+        if context.adapter.get_info().backend != wgpu::Backend::Vulkan
+            || !context
+                .device
+                .features()
+                .contains(wgpu::Features::TEXTURE_FORMAT_NV12)
+        {
+            return Err(ExternalFrameOutcome::Unsupported);
+        }
+
+        // SAFETY: the caller constructed the frame for this renderer device and
+        // promised that the texture is an initialized Vulkan NV12 image.
+        let Some(hal_device) = (unsafe { context.device.as_hal::<wgpu::hal::api::Vulkan>() })
+        else {
+            return Err(ExternalFrameOutcome::Unsupported);
+        };
+        if !hal_device
+            .enabled_device_extensions()
+            .contains(&EXTERNAL_SEMAPHORE_FD_EXTENSION)
+        {
+            return Err(ExternalFrameOutcome::Unsupported);
+        }
+
+        let (texture, sync_file, ownership) = frame.into_parts();
+        if ownership == ExternalOwnership::Foreign
+            && !hal_device
+                .enabled_device_extensions()
+                .contains(&QUEUE_FAMILY_FOREIGN_EXTENSION)
+        {
+            return Err(ExternalFrameOutcome::Unsupported);
+        }
+
+        let raw_device = hal_device.raw_device().clone();
+        let external_semaphore_fd = external_semaphore_fd::Device::new(
+            hal_device.shared_instance().raw_instance(),
+            &raw_device,
+        );
+        let external_sync = VulkanExternalSync {
+            fd: Some(sync_file),
+            device: raw_device,
+            external_semaphore_fd,
+            semaphore: None,
+            #[cfg(test)]
+            completion_probe: None,
+        };
+
+        Ok(Self {
+            external_sync: Some(external_sync),
+            initial_state: wgpu::TextureUses::RESOURCE,
+            ownership,
+            texture,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn import_sync(&mut self, queue: &wgpu::Queue) -> Result<(), vk::Result> {
         let Some(external_sync) = self.external_sync.as_mut() else {
             return Ok(());
         };
@@ -447,7 +474,7 @@ impl PreparedExternalFrame {
     }
 
     #[cfg(target_os = "linux")]
-    fn encode_ownership(&self, encoder: &mut wgpu::CommandEncoder) -> Result<(), ()> {
+    fn encode_acquire_ownership(&self, encoder: &mut wgpu::CommandEncoder) -> Result<(), ()> {
         if self.external_sync.is_none() {
             return Ok(());
         }
@@ -464,7 +491,8 @@ impl PreparedExternalFrame {
         let mut acquired = false;
         // SAFETY: `texture` and `encoder` are from the same Vulkan wgpu device; the encoder is
         // recording outside a render pass, and the descriptor records the producer's exact
-        // initialized layout and external queue-family ownership.
+        // externally owned GENERAL layout into the concrete tracked consumer state and records
+        // the external queue-family ownership.
         unsafe {
             encoder.as_hal_mut::<wgpu::hal::api::Vulkan, _, _>(|hal_encoder| {
                 let Some(hal_encoder) = hal_encoder else {
@@ -474,7 +502,7 @@ impl PreparedExternalFrame {
                     &texture,
                     &range,
                     self.initial_state,
-                    self.ownership.queue_family(),
+                    queue_family(self.ownership),
                 );
                 acquired = true;
             });
@@ -483,37 +511,128 @@ impl PreparedExternalFrame {
     }
 
     #[cfg(target_os = "linux")]
+    fn encode_release_ownership(&self, encoder: &mut wgpu::CommandEncoder) -> Result<(), ()> {
+        if self.external_sync.is_none() {
+            return Ok(());
+        }
+        let Some(texture) = (unsafe { self.texture.as_hal::<wgpu::hal::api::Vulkan>() }) else {
+            return Err(());
+        };
+        let range = wgpu::ImageSubresourceRange {
+            aspect: wgpu::TextureAspect::All,
+            base_mip_level: 0,
+            mip_level_count: Some(1),
+            base_array_layer: 0,
+            array_layer_count: Some(1),
+        };
+        let mut released = false;
+        // SAFETY: `texture` and `encoder` are from the same Vulkan wgpu device; the encoder is
+        // recording outside a render pass and RESOURCE is the tracked state after sampling.
+        unsafe {
+            encoder.as_hal_mut::<wgpu::hal::api::Vulkan, _, _>(|hal_encoder| {
+                let Some(hal_encoder) = hal_encoder else {
+                    return;
+                };
+                hal_encoder.release_external_texture_ownership(
+                    &texture,
+                    &range,
+                    queue_family(self.ownership),
+                );
+                released = true;
+            });
+        }
+        released.then_some(()).ok_or(())
+    }
+
+    #[cfg(target_os = "linux")]
     fn on_submitted(&mut self, queue: &wgpu::Queue) {
         let Some(external_sync) = self.external_sync.take() else {
             return;
         };
+        let texture = Arc::clone(&self.texture);
         queue.on_submitted_work_done(move || {
             drop(external_sync);
+            drop(texture);
         });
     }
 }
 
+enum PendingExternalFrame {
+    Prepared(PreparedExternalFrame),
+    #[cfg(target_os = "linux")]
+    Nv12(ExternalNv12Frame),
+}
+
 #[cfg(target_os = "linux")]
-impl ExternalFrameState<PreparedExternalFrame> {
-    fn prepare_submission(&mut self, queue: &wgpu::Queue) -> ExternalFrameOutcome {
-        let Some(frame) = self.latest.as_mut() else {
+impl ExternalFrameState<PendingExternalFrame> {
+    fn has_external_sync(&self) -> bool {
+        match self.latest.as_ref() {
+            Some(PendingExternalFrame::Prepared(frame)) => frame.external_sync.is_some(),
+            Some(PendingExternalFrame::Nv12(_)) => true,
+            None => false,
+        }
+    }
+
+    fn prepare_frame(&mut self, context: Option<&gpui::GpuContextHandle>) -> ExternalFrameOutcome {
+        let Some(frame) = self.latest.take() else {
             return ExternalFrameOutcome::Accepted;
         };
+        let frame = match frame {
+            PendingExternalFrame::Prepared(frame) => frame,
+            PendingExternalFrame::Nv12(frame) => {
+                let Some(context) = context else {
+                    return ExternalFrameOutcome::Unsupported;
+                };
+                match PreparedExternalFrame::from_external_nv12(context, frame) {
+                    Ok(frame) => frame,
+                    Err(outcome) => return outcome,
+                }
+            }
+        };
 
-        if let Err(error) = frame.prepare_submission(queue) {
-            self.latest = None;
-            return classify_external_sync_error(error);
-        }
-
+        self.latest = Some(PendingExternalFrame::Prepared(frame));
         ExternalFrameOutcome::Accepted
     }
 
-    #[cfg(target_os = "linux")]
-    fn encode_ownership(&mut self, encoder: &mut wgpu::CommandEncoder) -> ExternalFrameOutcome {
+    fn import_sync(&mut self, queue: &wgpu::Queue) -> ExternalFrameOutcome {
+        let Some(frame) = self.latest.as_mut() else {
+            return ExternalFrameOutcome::Accepted;
+        };
+        let PendingExternalFrame::Prepared(frame) = frame else {
+            self.latest = None;
+            return ExternalFrameOutcome::FatalFailure;
+        };
+        if let Err(error) = frame.import_sync(queue) {
+            self.latest = None;
+            return classify_external_sync_error(error);
+        }
+        ExternalFrameOutcome::Accepted
+    }
+
+    fn encode_acquire(&mut self, encoder: &mut wgpu::CommandEncoder) -> ExternalFrameOutcome {
         let Some(frame) = self.latest.as_ref() else {
             return ExternalFrameOutcome::Accepted;
         };
-        if frame.encode_ownership(encoder).is_err() {
+        let frame = match frame {
+            PendingExternalFrame::Prepared(frame) => frame,
+            PendingExternalFrame::Nv12(_) => return ExternalFrameOutcome::Accepted,
+        };
+        if frame.encode_acquire_ownership(encoder).is_err() {
+            self.latest = None;
+            return ExternalFrameOutcome::FatalFailure;
+        }
+        ExternalFrameOutcome::Accepted
+    }
+
+    fn encode_release(&mut self, encoder: &mut wgpu::CommandEncoder) -> ExternalFrameOutcome {
+        let Some(frame) = self.latest.as_ref() else {
+            return ExternalFrameOutcome::Accepted;
+        };
+        let frame = match frame {
+            PendingExternalFrame::Prepared(frame) => frame,
+            PendingExternalFrame::Nv12(_) => return ExternalFrameOutcome::FatalFailure,
+        };
+        if frame.encode_release_ownership(encoder).is_err() {
             self.latest = None;
             return ExternalFrameOutcome::FatalFailure;
         }
@@ -521,9 +640,9 @@ impl ExternalFrameState<PreparedExternalFrame> {
     }
 
     fn commit_after_submission_with_queue(&mut self, queue: &wgpu::Queue) {
-        if let Some(mut frame) = self.latest.take() {
+        if let Some(PendingExternalFrame::Prepared(mut frame)) = self.latest.take() {
             frame.on_submitted(queue);
-            self.displayed = Some(frame);
+            self.displayed = Some(PendingExternalFrame::Prepared(frame));
         }
     }
 }
@@ -812,7 +931,7 @@ pub struct WgpuRenderer {
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     surface_configured: bool,
     needs_redraw: bool,
-    external_frames: ExternalFrameState<PreparedExternalFrame>,
+    external_frames: ExternalFrameState<PendingExternalFrame>,
     last_external_frame_outcome: Option<ExternalFrameOutcome>,
 }
 
@@ -854,7 +973,10 @@ impl WgpuRenderer {
     /// changing normal drawing.
     pub fn submit_external_frame(&mut self, frame: ExternalFrame) -> ExternalFrameOutcome {
         let (acquisition, frame) = match frame {
-            ExternalFrame::Prepared(frame) => (ExternalFrameAcquisition::Prepared, Some(frame)),
+            ExternalFrame::Prepared(frame) => (
+                ExternalFrameAcquisition::Prepared,
+                Some(PendingExternalFrame::Prepared(frame)),
+            ),
             ExternalFrame::TransientFailure => (ExternalFrameAcquisition::TransientFailure, None),
             ExternalFrame::FatalFailure => (ExternalFrameAcquisition::FatalFailure, None),
         };
@@ -865,9 +987,36 @@ impl WgpuRenderer {
         outcome
     }
 
+    /// Stage a typed external NV12 request for the next normal submission.
+    #[cfg(target_os = "linux")]
+    pub fn submit_external_frame_request(
+        &mut self,
+        request: ExternalFrameRequest,
+    ) -> ExternalFrameOutcome {
+        let (acquisition, frame) = match request {
+            ExternalFrameRequest::Prepared(frame) => (
+                ExternalFrameAcquisition::Prepared,
+                Some(PendingExternalFrame::Nv12(frame)),
+            ),
+            ExternalFrameRequest::TransientFailure => {
+                (ExternalFrameAcquisition::TransientFailure, None)
+            }
+            ExternalFrameRequest::FatalFailure => (ExternalFrameAcquisition::FatalFailure, None),
+        };
+        let outcome = self
+            .external_frames
+            .stage(self.adapter_info.backend, acquisition, frame);
+        self.last_external_frame_outcome = Some(outcome);
+        outcome
+    }
+
     /// Return the texture from the last accepted and presented external frame.
     pub fn displayed_external_frame(&self) -> Option<&PreparedExternalFrame> {
-        self.external_frames.displayed()
+        match self.external_frames.displayed()? {
+            PendingExternalFrame::Prepared(frame) => Some(frame),
+            #[cfg(target_os = "linux")]
+            PendingExternalFrame::Nv12(_) => None,
+        }
     }
 
     /// Take the outcome from the most recent external-frame submission or
@@ -2074,17 +2223,28 @@ impl WgpuRenderer {
                 });
 
         #[cfg(target_os = "linux")]
-        let mut ownership_encoder = self.resources().device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor { label: Some("external_ownership_encoder") },
-        );
-        #[cfg(target_os = "linux")]
-        {
-            let outcome = self.external_frames.encode_ownership(&mut ownership_encoder);
+        let (mut acquire_encoder, mut release_encoder) = {
+            let context = self.gpu_context_handle();
+            let outcome = self.external_frames.prepare_frame(context.as_ref());
             if outcome != ExternalFrameOutcome::Accepted {
                 self.last_external_frame_outcome = Some(outcome);
-                anyhow::bail!("external frame ownership encoding failed");
+                anyhow::bail!("external frame preparation failed");
             }
-        }
+            if self.external_frames.has_external_sync() {
+                let mut acquire = self.resources().device.create_command_encoder(
+                    &wgpu::CommandEncoderDescriptor { label: Some("external_acquire_encoder") });
+                let release = self.resources().device.create_command_encoder(
+                    &wgpu::CommandEncoderDescriptor { label: Some("external_release_encoder") });
+                let outcome = self.external_frames.encode_acquire(&mut acquire);
+                if outcome != ExternalFrameOutcome::Accepted {
+                    self.last_external_frame_outcome = Some(outcome);
+                    anyhow::bail!("external frame acquire encoding failed");
+                }
+                (Some(acquire), Some(release))
+            } else {
+                (None, None)
+            }
+        };
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2195,19 +2355,25 @@ impl WgpuRenderer {
             }
         }
 
-        #[cfg(target_os = "linux")]
-        let ownership_command_buffer = ownership_encoder.finish();
         let render_command_buffer = encoder.finish();
         #[cfg(target_os = "linux")]
-        {
-            let outcome = self.external_frames.prepare_submission(&queue);
+        if let (Some(acquire), Some(mut release)) = (acquire_encoder.take(), release_encoder.take()) {
+            let outcome = self.external_frames.encode_release(&mut release);
+            if outcome != ExternalFrameOutcome::Accepted {
+                self.last_external_frame_outcome = Some(outcome);
+                anyhow::bail!("external frame release encoding failed");
+            }
+            let acquire_commands = acquire.finish();
+            let release_commands = release.finish();
+            let outcome = self.external_frames.import_sync(&queue);
             if outcome != ExternalFrameOutcome::Accepted {
                 self.last_external_frame_outcome = Some(outcome);
                 anyhow::bail!("external frame acquire preparation failed");
             }
+            queue.submit([acquire_commands, render_command_buffer, release_commands]);
+        } else {
+            queue.submit(std::iter::once(render_command_buffer));
         }
-        #[cfg(target_os = "linux")]
-        queue.submit([ownership_command_buffer, render_command_buffer]);
         #[cfg(not(target_os = "linux"))]
         queue.submit(std::iter::once(render_command_buffer));
         #[cfg(target_os = "linux")]
@@ -2406,6 +2572,46 @@ impl WgpuRenderer {
                     let cb_cr_view =
                         cb_cr_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+                    nv12_items.push(Nv12Data {
+                        y_view,
+                        cb_cr_view,
+                        params_data: params_data.to_vec(),
+                        scissor_rect: (
+                            surface.content_mask.bounds.origin.x.0.max(0.0) as u32,
+                            surface.content_mask.bounds.origin.y.0.max(0.0) as u32,
+                            surface.content_mask.bounds.size.width.0.max(0.0) as u32,
+                            surface.content_mask.bounds.size.height.0.max(0.0) as u32,
+                        ),
+                    });
+                }
+                gpui::SurfaceContent::WgpuTextureNv12Multiplanar {
+                    texture,
+                    color_transform,
+                    ..
+                } => {
+                    let params = SurfaceParams::new(
+                        surface.bounds.into(),
+                        surface.content_mask.bounds.into(),
+                        *color_transform,
+                    );
+                    let params_data = unsafe {
+                        std::slice::from_raw_parts(
+                            &params as *const SurfaceParams as *const u8,
+                            std::mem::size_of::<SurfaceParams>(),
+                        )
+                    };
+                    let Some(plane0_descriptor) =
+                        nv12_plane_view_descriptor(wgpu::TextureAspect::Plane0)
+                    else {
+                        return false;
+                    };
+                    let Some(plane1_descriptor) =
+                        nv12_plane_view_descriptor(wgpu::TextureAspect::Plane1)
+                    else {
+                        return false;
+                    };
+                    let y_view = texture.create_view(&plane0_descriptor);
+                    let cb_cr_view = texture.create_view(&plane1_descriptor);
                     nv12_items.push(Nv12Data {
                         y_view,
                         cb_cr_view,
@@ -3096,9 +3302,27 @@ mod external_frame_tests {
             ExternalFrameOutcome::FatalFailure
         );
         assert_eq!(
-            ExternalFrameOutcome::classify(wgpu::Backend::Gl, ExternalFrameAcquisition::Prepared,),
+            ExternalFrameOutcome::classify(wgpu::Backend::Gl, ExternalFrameAcquisition::Prepared),
             ExternalFrameOutcome::Unsupported
         );
+    }
+
+    #[test]
+    fn nv12_plane_views_use_explicit_aspect_formats() {
+        let plane0 = match super::nv12_plane_view_descriptor(wgpu::TextureAspect::Plane0) {
+            Some(descriptor) => descriptor,
+            None => panic!("plane 0 descriptor must exist"),
+        };
+        assert_eq!(plane0.aspect, wgpu::TextureAspect::Plane0);
+        assert_eq!(plane0.format, Some(wgpu::TextureFormat::R8Unorm));
+
+        let plane1 = match super::nv12_plane_view_descriptor(wgpu::TextureAspect::Plane1) {
+            Some(descriptor) => descriptor,
+            None => panic!("plane 1 descriptor must exist"),
+        };
+        assert_eq!(plane1.aspect, wgpu::TextureAspect::Plane1);
+        assert_eq!(plane1.format, Some(wgpu::TextureFormat::Rg8Unorm));
+        assert!(super::nv12_plane_view_descriptor(wgpu::TextureAspect::All).is_none());
     }
 
     #[test]
@@ -3220,11 +3444,11 @@ mod external_frame_tests {
     #[test]
     fn ownership_family_mapping_is_restricted_to_external_families() {
         assert_eq!(
-            ExternalOwnership::External.queue_family(),
+            super::queue_family(ExternalOwnership::External),
             vk::QUEUE_FAMILY_EXTERNAL
         );
         assert_eq!(
-            ExternalOwnership::Foreign.queue_family(),
+            super::queue_family(ExternalOwnership::Foreign),
             vk::QUEUE_FAMILY_FOREIGN_EXT
         );
     }
@@ -3648,7 +3872,7 @@ mod vulkan_external_frame_integration {
                     .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                     .dst_access_mask(vk::AccessFlags::empty())
                     .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
                     .src_queue_family_index(queue_family)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL);
                 raw_device.cmd_pipeline_barrier(
@@ -3766,18 +3990,22 @@ mod vulkan_external_frame_integration {
                 ],
             });
 
-            // Keep raw ownership recording separate from the normal consumer encoder. Both
+            // Keep ownership transitions separate from the normal consumer encoder. All three
             // command buffers are submitted together through the normal wgpu queue.
-            let mut ownership_encoder =
+            let mut acquire_encoder =
                 device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("vulkan_external_frame_integration_ownership"),
+                    label: Some("vulkan_external_frame_integration_acquire"),
                 });
             let mut consumer_encoder =
                 device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("vulkan_external_frame_integration_consumer"),
                 });
+            let mut release_encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("vulkan_external_frame_integration_release"),
+                });
             assert_eq!(
-                prepared.encode_ownership(&mut ownership_encoder),
+                prepared.encode_acquire_ownership(&mut acquire_encoder),
                 Ok(()),
                 "Vulkan ownership acquire must use the live external texture"
             );
@@ -3792,12 +4020,23 @@ mod vulkan_external_frame_integration {
                 pass.dispatch_workgroups(1, 1, 1);
             }
 
-            let ownership_command_buffer = ownership_encoder.finish();
+            assert_eq!(
+                prepared.encode_release_ownership(&mut release_encoder),
+                Ok(()),
+                "Vulkan ownership release must use the live external texture"
+            );
+
+            let acquire_command_buffer = acquire_encoder.finish();
             let consumer_command_buffer = consumer_encoder.finish();
+            let release_command_buffer = release_encoder.finish();
             prepared
-                .prepare_submission(&queue)
+                .import_sync(&queue)
                 .map_err(|error| anyhow::anyhow!("importing exported sync fd: {error:?}"))?;
-            queue.submit([ownership_command_buffer, consumer_command_buffer]);
+            queue.submit([
+                acquire_command_buffer,
+                consumer_command_buffer,
+                release_command_buffer,
+            ]);
             prepared.on_submitted(&queue);
             assert!(prepared.external_sync.is_none());
             drop(prepared);

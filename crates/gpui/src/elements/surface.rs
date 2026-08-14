@@ -67,6 +67,14 @@ pub enum SurfaceSource {
         native_size: Size<DevicePixels>,
         color_transform: Nv12ColorTransform,
     },
+    /// One multiplanar NV12 wgpu texture with an explicit color transform.
+    #[cfg(feature = "wgpu")]
+    #[expect(missing_docs)]
+    Nv12MultiplanarTexture {
+        texture: Arc<wgpu::Texture>,
+        native_size: Size<DevicePixels>,
+        color_transform: Nv12ColorTransform,
+    },
 }
 
 #[cfg(target_os = "macos")]
@@ -143,6 +151,23 @@ impl
         SurfaceSource::Nv12TextureWithColorTransform {
             y_texture,
             cb_cr_texture,
+            native_size,
+            color_transform,
+        }
+    }
+}
+
+#[cfg(feature = "wgpu")]
+impl From<(Arc<wgpu::Texture>, Size<DevicePixels>, Nv12ColorTransform)> for SurfaceSource {
+    fn from(
+        (texture, native_size, color_transform): (
+            Arc<wgpu::Texture>,
+            Size<DevicePixels>,
+            Nv12ColorTransform,
+        ),
+    ) -> Self {
+        SurfaceSource::Nv12MultiplanarTexture {
+            texture,
             native_size,
             color_transform,
         }
@@ -245,7 +270,8 @@ impl Element for Surface {
             }
             #[cfg(feature = "wgpu")]
             SurfaceSource::Nv12Texture { native_size, .. }
-            | SurfaceSource::Nv12TextureWithColorTransform { native_size, .. } => {
+            | SurfaceSource::Nv12TextureWithColorTransform { native_size, .. }
+            | SurfaceSource::Nv12MultiplanarTexture { native_size, .. } => {
                 if native_size.height.0 > 0 {
                     style.aspect_ratio =
                         Some(native_size.width.0 as f32 / native_size.height.0 as f32);
@@ -375,6 +401,20 @@ impl Element for Surface {
                             paint_bounds,
                             y_texture.clone(),
                             cb_cr_texture.clone(),
+                            *native_size,
+                            *color_transform,
+                        );
+                    }
+                    #[cfg(feature = "wgpu")]
+                    SurfaceSource::Nv12MultiplanarTexture {
+                        texture,
+                        native_size,
+                        color_transform,
+                    } => {
+                        let paint_bounds = self.object_fit.get_bounds(bounds, *native_size);
+                        window.paint_surface_with_nv12_multiplanar_texture(
+                            paint_bounds,
+                            texture.clone(),
                             *native_size,
                             *color_transform,
                         );

@@ -9,6 +9,8 @@ use gpui::{
     Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
     WindowDecorations, WindowKind, WindowParams, popup::PopupNotSupportedError, px,
 };
+#[cfg(target_os = "linux")]
+use gpui::{ExternalFrameOutcome, ExternalFrameRequest};
 use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig};
 
 use collections::FxHashSet;
@@ -1940,6 +1942,24 @@ impl PlatformWindow for X11Window {
 
     fn gpu_context(&self) -> Option<GpuContextHandle> {
         self.0.state.borrow().renderer.gpu_context_handle()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn submit_external_frame(&self, request: ExternalFrameRequest) -> ExternalFrameOutcome {
+        self.0
+            .state
+            .borrow_mut()
+            .renderer
+            .submit_external_frame_request(request)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn take_external_frame_outcome(&self) -> Option<ExternalFrameOutcome> {
+        self.0
+            .state
+            .borrow_mut()
+            .renderer
+            .take_external_frame_outcome()
     }
 
     fn play_system_bell(&self) {

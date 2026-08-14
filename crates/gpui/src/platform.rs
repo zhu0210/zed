@@ -62,6 +62,8 @@ use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::io::Cursor;
 use std::ops;
+#[cfg(all(target_os = "linux", feature = "wgpu"))]
+use std::os::fd::OwnedFd;
 use std::time::Duration;
 use std::{
     ffi::OsString,
@@ -380,15 +382,11 @@ pub trait Platform: 'static {
             display: None,
         });
 
-        let adapters = crate::block_on(
-            instance.enumerate_adapters(wgpu::Backends::all()),
-        );
+        let adapters = crate::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
 
         let adapter = adapters
             .into_iter()
-            .find(|a| {
-                a.get_info().device_type != wgpu::DeviceType::Cpu
-            })
+            .find(|a| a.get_info().device_type != wgpu::DeviceType::Cpu)
             .ok_or_else(|| anyhow::anyhow!("No suitable GPU adapter found"))?;
 
         let info = adapter.get_info();
@@ -1041,6 +1039,19 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         None
     }
 
+    /// Submit an external NV12 frame to the Linux wgpu renderer.
+    #[cfg(all(target_os = "linux", feature = "wgpu"))]
+    fn submit_external_frame(&self, _request: ExternalFrameRequest) -> ExternalFrameOutcome {
+        ExternalFrameOutcome::Unsupported
+    }
+
+    /// Take the one-shot outcome produced while the renderer consumed an
+    /// external frame request.
+    #[cfg(all(target_os = "linux", feature = "wgpu"))]
+    fn take_external_frame_outcome(&self) -> Option<ExternalFrameOutcome> {
+        None
+    }
+
     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
 
     // Mobile platform methods.
@@ -1604,6 +1615,119 @@ pub struct GpuContextHandle {
     /// Whether the device supports dual-source blending (enables subpixel
     /// text antialiasing).
     pub supports_dual_source_blending: bool,
+}
+
+/// Queue-family ownership held by the producer of an external Linux image.
+#[cfg(all(target_os = "linux", feature = "wgpu"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExternalOwnership {
+    /// The image is handed over through `VK_QUEUE_FAMILY_EXTERNAL_KHR`.
+    External,
+    /// The image is handed over through `VK_QUEUE_FAMILY_FOREIGN_EXT`.
+    Foreign,
+}
+
+/// An external, producer-owned multiplanar NV12 texture.
+#[cfg(all(target_os = "linux", feature = "wgpu"))]
+pub struct ExternalNv12Frame {
+    texture: Arc<wgpu::Texture>,
+    sync_file: OwnedFd,
+    ownership: ExternalOwnership,
+}
+
+#[cfg(all(target_os = "linux", feature = "wgpu"))]
+impl ExternalNv12Frame {
+    /// Wrap a renderer-device NV12 texture and its producer release fence.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee that `texture` was created on the target
+    /// window renderer device, has `TextureFormat::NV12` and
+    /// `TEXTURE_BINDING` usage, and that its actual externally owned Vulkan
+    /// image layout is `GENERAL` while its wgpu tracked consumer state is
+    /// `TextureUses::RESOURCE`. The producer must have released the image to
+    /// `ownership` and signaled `sync_file`. Any producer backing lease must
+    /// be retained by the texture's HAL drop callback until the renderer's
+    /// completion callback runs.
+    pub unsafe fn new(
+        texture: Arc<wgpu::Texture>,
+        sync_file: OwnedFd,
+        ownership: ExternalOwnership,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            texture.format() == wgpu::TextureFormat::NV12,
+            "external frame texture must use NV12"
+        );
+        anyhow::ensure!(
+            texture
+                .usage()
+                .contains(wgpu::TextureUsages::TEXTURE_BINDING),
+            "external frame texture must allow texture binding"
+        );
+        Ok(Self {
+            texture,
+            sync_file,
+            ownership,
+        })
+    }
+
+    /// Consume the frame and return its renderer-boundary resources.
+    pub fn into_parts(self) -> (Arc<wgpu::Texture>, OwnedFd, ExternalOwnership) {
+        (self.texture, self.sync_file, self.ownership)
+    }
+}
+
+/// A typed request to submit an external NV12 frame.
+#[cfg(all(target_os = "linux", feature = "wgpu"))]
+pub enum ExternalFrameRequest {
+    /// The producer prepared a frame for submission.
+    Prepared(ExternalNv12Frame),
+    /// The producer could not acquire a frame this tick.
+    TransientFailure,
+    /// The producer encountered an unrecoverable failure.
+    FatalFailure,
+}
+
+/// Result of handing an external frame to a renderer.
+#[cfg(feature = "wgpu")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExternalFrameOutcome {
+    /// The frame was accepted for the next normal submission.
+    Accepted,
+    /// The active renderer cannot consume this frame type.
+    Unsupported,
+    /// The frame was rejected for a recoverable reason.
+    TransientFailure,
+    /// The frame was rejected for an unrecoverable reason.
+    FatalFailure,
+}
+
+/// The result of trying to acquire an external frame.
+#[cfg(feature = "wgpu")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExternalFrameAcquisition {
+    /// A frame was prepared and can be submitted.
+    Prepared,
+    /// The frame was not ready this tick, but the stream may recover.
+    TransientFailure,
+    /// The stream cannot recover without intervention.
+    FatalFailure,
+}
+
+#[cfg(feature = "wgpu")]
+impl ExternalFrameOutcome {
+    /// Classify an acquisition result for a renderer backend.
+    pub fn classify(backend: wgpu::Backend, acquisition: ExternalFrameAcquisition) -> Self {
+        if backend != wgpu::Backend::Vulkan {
+            return Self::Unsupported;
+        }
+
+        match acquisition {
+            ExternalFrameAcquisition::Prepared => Self::Accepted,
+            ExternalFrameAcquisition::TransientFailure => Self::TransientFailure,
+            ExternalFrameAcquisition::FatalFailure => Self::FatalFailure,
+        }
+    }
 }
 
 #[expect(missing_docs)]

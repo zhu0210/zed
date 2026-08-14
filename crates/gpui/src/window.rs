@@ -28,6 +28,8 @@ use crate::{
     WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
     point, prelude::*, px, rems, size, transparent_black,
 };
+#[cfg(all(target_os = "linux", feature = "wgpu"))]
+use crate::{ExternalFrameOutcome, ExternalFrameRequest};
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
 use crate::interactive::TouchEvent;
@@ -4879,6 +4881,32 @@ impl Window {
             },
         });
     }
+
+    /// Paint one multiplanar NV12 wgpu texture using an explicit color transform.
+    #[cfg(feature = "wgpu")]
+    pub fn paint_surface_with_nv12_multiplanar_texture(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        texture: Arc<wgpu::Texture>,
+        native_size: Size<DevicePixels>,
+        color_transform: crate::Nv12ColorTransform,
+    ) {
+        use crate::{PaintSurface, SurfaceContent};
+
+        self.invalidator.debug_assert_paint();
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            content: SurfaceContent::WgpuTextureNv12Multiplanar {
+                texture,
+                native_size,
+                color_transform,
+            },
+        });
+    }
 }
 
 /// Convert a CVPixelBuffer pixel format code to a GPUI [`GpuTextureFormat`].
@@ -6640,6 +6668,19 @@ impl Window {
     #[cfg(feature = "wgpu")]
     pub fn gpu_context(&self) -> Option<GpuContextHandle> {
         self.platform_window.gpu_context()
+    }
+
+    /// Submit an external NV12 frame to this window's Linux wgpu renderer.
+    #[cfg(all(target_os = "linux", feature = "wgpu"))]
+    pub fn submit_external_frame(&self, request: ExternalFrameRequest) -> ExternalFrameOutcome {
+        self.platform_window.submit_external_frame(request)
+    }
+
+    /// Take the one-shot outcome produced while the renderer consumed an
+    /// external frame request.
+    #[cfg(all(target_os = "linux", feature = "wgpu"))]
+    pub fn take_external_frame_outcome(&self) -> Option<ExternalFrameOutcome> {
+        self.platform_window.take_external_frame_outcome()
     }
 
     /// Perform titlebar double-click action.

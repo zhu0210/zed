@@ -793,6 +793,14 @@ pub enum SurfaceContent {
         native_size: Size<DevicePixels>,
         color_transform: crate::Nv12ColorTransform,
     },
+    /// Cross-platform multiplanar NV12 wgpu texture with an explicit color transform.
+    #[cfg(feature = "wgpu")]
+    #[expect(missing_docs)]
+    WgpuTextureNv12Multiplanar {
+        texture: Arc<wgpu::Texture>,
+        native_size: Size<DevicePixels>,
+        color_transform: crate::Nv12ColorTransform,
+    },
 }
 
 /// A GPU texture composited into the scene.

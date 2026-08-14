@@ -260,6 +260,13 @@ impl WgpuContext {
             );
         }
 
+        if adapter
+            .features()
+            .contains(wgpu::Features::TEXTURE_FORMAT_NV12)
+        {
+            required_features |= wgpu::Features::TEXTURE_FORMAT_NV12;
+        }
+
         let color_atlas_texture_format = Self::select_color_texture_format(adapter)?;
         #[cfg(target_family = "wasm")]
         let required_limits = if adapter.get_info().backend == wgpu::Backend::Gl {
