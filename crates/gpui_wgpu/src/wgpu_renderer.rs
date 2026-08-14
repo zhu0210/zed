@@ -262,7 +262,7 @@ pub struct PreparedExternalFrame {
     #[cfg(target_os = "linux")]
     initial_state: wgpu::TextureUses,
     #[cfg(target_os = "linux")]
-    ownership: ExternalOwnership,
+    ownership: Option<ExternalOwnership>,
     texture: Arc<wgpu::Texture>,
 }
 
@@ -275,7 +275,7 @@ impl PreparedExternalFrame {
             #[cfg(target_os = "linux")]
             initial_state: wgpu::TextureUses::RESOURCE,
             #[cfg(target_os = "linux")]
-            ownership: ExternalOwnership::External,
+            ownership: None,
             texture,
         }
     }
@@ -397,7 +397,7 @@ impl PreparedExternalFrame {
         Ok(Self {
             external_sync: Some(external_sync),
             initial_state: frame.initial_state,
-            ownership: frame.ownership,
+            ownership: Some(frame.ownership),
             texture: Arc::new(texture),
         })
     }
@@ -455,9 +455,14 @@ impl PreparedExternalFrame {
         Ok(Self {
             external_sync: Some(external_sync),
             initial_state: wgpu::TextureUses::RESOURCE,
-            ownership,
+            ownership: Some(ownership),
             texture,
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_external(&self) -> bool {
+        self.ownership.is_some()
     }
 
     #[cfg(target_os = "linux")]
@@ -475,9 +480,9 @@ impl PreparedExternalFrame {
 
     #[cfg(target_os = "linux")]
     fn encode_acquire_ownership(&self, encoder: &mut wgpu::CommandEncoder) -> Result<(), ()> {
-        if self.external_sync.is_none() {
+        let Some(ownership) = self.ownership else {
             return Ok(());
-        }
+        };
         let Some(texture) = (unsafe { self.texture.as_hal::<wgpu::hal::api::Vulkan>() }) else {
             return Err(());
         };
@@ -502,7 +507,7 @@ impl PreparedExternalFrame {
                     &texture,
                     &range,
                     self.initial_state,
-                    queue_family(self.ownership),
+                    queue_family(ownership),
                 );
                 acquired = true;
             });
@@ -512,9 +517,9 @@ impl PreparedExternalFrame {
 
     #[cfg(target_os = "linux")]
     fn encode_release_ownership(&self, encoder: &mut wgpu::CommandEncoder) -> Result<(), ()> {
-        if self.external_sync.is_none() {
+        let Some(ownership) = self.ownership else {
             return Ok(());
-        }
+        };
         let Some(texture) = (unsafe { self.texture.as_hal::<wgpu::hal::api::Vulkan>() }) else {
             return Err(());
         };
@@ -536,7 +541,7 @@ impl PreparedExternalFrame {
                 hal_encoder.release_external_texture_ownership(
                     &texture,
                     &range,
-                    queue_family(self.ownership),
+                    queue_family(ownership),
                 );
                 released = true;
             });
@@ -546,9 +551,10 @@ impl PreparedExternalFrame {
 
     #[cfg(target_os = "linux")]
     fn on_submitted(&mut self, queue: &wgpu::Queue) {
-        let Some(external_sync) = self.external_sync.take() else {
+        if !self.is_external() {
             return;
-        };
+        }
+        let external_sync = self.external_sync.take();
         let texture = Arc::clone(&self.texture);
         queue.on_submitted_work_done(move || {
             drop(external_sync);
@@ -565,11 +571,34 @@ enum PendingExternalFrame {
 
 #[cfg(target_os = "linux")]
 impl ExternalFrameState<PendingExternalFrame> {
-    fn has_external_sync(&self) -> bool {
-        match self.latest.as_ref() {
-            Some(PendingExternalFrame::Prepared(frame)) => frame.external_sync.is_some(),
-            Some(PendingExternalFrame::Nv12(_)) => true,
-            None => false,
+    fn selection_for_scene(&self, scene: &Scene) -> Option<ExternalFrameSlot> {
+        self.select_matching(|frame| match frame {
+            PendingExternalFrame::Prepared(frame) => scene_contains_texture(scene, frame.texture()),
+            PendingExternalFrame::Nv12(_) => false,
+        })
+    }
+
+    fn selected(&self, slot: ExternalFrameSlot) -> Option<&PendingExternalFrame> {
+        match slot {
+            ExternalFrameSlot::Latest => self.latest.as_ref(),
+            ExternalFrameSlot::Displayed => self.displayed.as_ref(),
+        }
+    }
+
+    fn selected_mut(&mut self, slot: ExternalFrameSlot) -> Option<&mut PendingExternalFrame> {
+        match slot {
+            ExternalFrameSlot::Latest => self.latest.as_mut(),
+            ExternalFrameSlot::Displayed => self.displayed.as_mut(),
+        }
+    }
+
+    fn selected_is_external(&self, slot: ExternalFrameSlot) -> bool {
+        matches!(self.selected(slot), Some(PendingExternalFrame::Prepared(frame)) if frame.is_external())
+    }
+
+    fn clear_selected_latest(&mut self, slot: ExternalFrameSlot) {
+        if slot == ExternalFrameSlot::Latest {
+            self.latest = None;
         }
     }
 
@@ -594,23 +623,34 @@ impl ExternalFrameState<PendingExternalFrame> {
         ExternalFrameOutcome::Accepted
     }
 
-    fn import_sync(&mut self, queue: &wgpu::Queue) -> ExternalFrameOutcome {
-        let Some(frame) = self.latest.as_mut() else {
+    fn import_sync(
+        &mut self,
+        slot: ExternalFrameSlot,
+        queue: &wgpu::Queue,
+    ) -> ExternalFrameOutcome {
+        if slot == ExternalFrameSlot::Displayed {
+            return ExternalFrameOutcome::Accepted;
+        }
+        let Some(frame) = self.selected_mut(slot) else {
             return ExternalFrameOutcome::Accepted;
         };
         let PendingExternalFrame::Prepared(frame) = frame else {
-            self.latest = None;
+            self.clear_selected_latest(slot);
             return ExternalFrameOutcome::FatalFailure;
         };
         if let Err(error) = frame.import_sync(queue) {
-            self.latest = None;
+            self.clear_selected_latest(slot);
             return classify_external_sync_error(error);
         }
         ExternalFrameOutcome::Accepted
     }
 
-    fn encode_acquire(&mut self, encoder: &mut wgpu::CommandEncoder) -> ExternalFrameOutcome {
-        let Some(frame) = self.latest.as_ref() else {
+    fn encode_acquire(
+        &mut self,
+        slot: ExternalFrameSlot,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> ExternalFrameOutcome {
+        let Some(frame) = self.selected(slot) else {
             return ExternalFrameOutcome::Accepted;
         };
         let frame = match frame {
@@ -618,14 +658,18 @@ impl ExternalFrameState<PendingExternalFrame> {
             PendingExternalFrame::Nv12(_) => return ExternalFrameOutcome::Accepted,
         };
         if frame.encode_acquire_ownership(encoder).is_err() {
-            self.latest = None;
+            self.clear_selected_latest(slot);
             return ExternalFrameOutcome::FatalFailure;
         }
         ExternalFrameOutcome::Accepted
     }
 
-    fn encode_release(&mut self, encoder: &mut wgpu::CommandEncoder) -> ExternalFrameOutcome {
-        let Some(frame) = self.latest.as_ref() else {
+    fn encode_release(
+        &mut self,
+        slot: ExternalFrameSlot,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> ExternalFrameOutcome {
+        let Some(frame) = self.selected(slot) else {
             return ExternalFrameOutcome::Accepted;
         };
         let frame = match frame {
@@ -633,18 +677,44 @@ impl ExternalFrameState<PendingExternalFrame> {
             PendingExternalFrame::Nv12(_) => return ExternalFrameOutcome::FatalFailure,
         };
         if frame.encode_release_ownership(encoder).is_err() {
-            self.latest = None;
+            self.clear_selected_latest(slot);
             return ExternalFrameOutcome::FatalFailure;
         }
         ExternalFrameOutcome::Accepted
     }
 
-    fn commit_after_submission_with_queue(&mut self, queue: &wgpu::Queue) {
-        if let Some(PendingExternalFrame::Prepared(mut frame)) = self.latest.take() {
-            frame.on_submitted(queue);
-            self.displayed = Some(PendingExternalFrame::Prepared(frame));
+    fn commit_after_submission_with_queue(
+        &mut self,
+        slot: Option<ExternalFrameSlot>,
+        queue: &wgpu::Queue,
+    ) {
+        match slot {
+            Some(ExternalFrameSlot::Latest) => {
+                if let Some(PendingExternalFrame::Prepared(mut frame)) = self.latest.take() {
+                    frame.on_submitted(queue);
+                    self.displayed = Some(PendingExternalFrame::Prepared(frame));
+                }
+            }
+            Some(ExternalFrameSlot::Displayed) => {
+                if let Some(PendingExternalFrame::Prepared(frame)) = self.displayed.as_mut() {
+                    frame.on_submitted(queue);
+                }
+            }
+            None => {}
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn scene_contains_texture(scene: &Scene, texture: &Arc<wgpu::Texture>) -> bool {
+    scene.surfaces.iter().any(|surface| match &surface.content {
+        gpui::SurfaceContent::WgpuTexture(candidate) => Arc::ptr_eq(candidate, texture),
+        gpui::SurfaceContent::WgpuTextureNv12Multiplanar {
+            texture: candidate, ..
+        } => Arc::ptr_eq(candidate, texture),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -772,6 +842,13 @@ struct ExternalFrameState<T> {
     displayed: Option<T>,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExternalFrameSlot {
+    Latest,
+    Displayed,
+}
+
 impl<T> Default for ExternalFrameState<T> {
     fn default() -> Self {
         Self {
@@ -801,6 +878,21 @@ impl<T> ExternalFrameState<T> {
             ExternalFrameOutcome::Unsupported => {}
         }
         outcome
+    }
+
+    #[cfg(target_os = "linux")]
+    fn select_matching(&self, matches: impl Fn(&T) -> bool) -> Option<ExternalFrameSlot> {
+        if let Some(frame) = self.latest.as_ref() {
+            if matches(frame) {
+                return Some(ExternalFrameSlot::Latest);
+            }
+        }
+        if let Some(frame) = self.displayed.as_ref() {
+            if matches(frame) {
+                return Some(ExternalFrameSlot::Displayed);
+            }
+        }
+        None
     }
 
     #[cfg(any(test, not(target_os = "linux")))]
@@ -2223,19 +2315,23 @@ impl WgpuRenderer {
                 });
 
         #[cfg(target_os = "linux")]
-        let (mut acquire_encoder, mut release_encoder) = {
+        let external_selection = {
             let context = self.gpu_context_handle();
             let outcome = self.external_frames.prepare_frame(context.as_ref());
             if outcome != ExternalFrameOutcome::Accepted {
                 self.last_external_frame_outcome = Some(outcome);
                 anyhow::bail!("external frame preparation failed");
             }
-            if self.external_frames.has_external_sync() {
+            self.external_frames.selection_for_scene(scene)
+        };
+        #[cfg(target_os = "linux")]
+        let (mut acquire_encoder, mut release_encoder) = {
+            if let Some(selection) = external_selection.filter(|slot| self.external_frames.selected_is_external(*slot)) {
                 let mut acquire = self.resources().device.create_command_encoder(
                     &wgpu::CommandEncoderDescriptor { label: Some("external_acquire_encoder") });
                 let release = self.resources().device.create_command_encoder(
                     &wgpu::CommandEncoderDescriptor { label: Some("external_release_encoder") });
-                let outcome = self.external_frames.encode_acquire(&mut acquire);
+                let outcome = self.external_frames.encode_acquire(selection, &mut acquire);
                 if outcome != ExternalFrameOutcome::Accepted {
                     self.last_external_frame_outcome = Some(outcome);
                     anyhow::bail!("external frame acquire encoding failed");
@@ -2357,15 +2453,15 @@ impl WgpuRenderer {
 
         let render_command_buffer = encoder.finish();
         #[cfg(target_os = "linux")]
-        if let (Some(acquire), Some(mut release)) = (acquire_encoder.take(), release_encoder.take()) {
-            let outcome = self.external_frames.encode_release(&mut release);
+        if let (Some(selection), Some(acquire), Some(mut release)) = (external_selection, acquire_encoder.take(), release_encoder.take()) {
+            let outcome = self.external_frames.encode_release(selection, &mut release);
             if outcome != ExternalFrameOutcome::Accepted {
                 self.last_external_frame_outcome = Some(outcome);
                 anyhow::bail!("external frame release encoding failed");
             }
             let acquire_commands = acquire.finish();
             let release_commands = release.finish();
-            let outcome = self.external_frames.import_sync(&queue);
+            let outcome = self.external_frames.import_sync(selection, &queue);
             if outcome != ExternalFrameOutcome::Accepted {
                 self.last_external_frame_outcome = Some(outcome);
                 anyhow::bail!("external frame acquire preparation failed");
@@ -2378,7 +2474,7 @@ impl WgpuRenderer {
         queue.submit(std::iter::once(render_command_buffer));
         #[cfg(target_os = "linux")]
         self.external_frames
-            .commit_after_submission_with_queue(&queue);
+            .commit_after_submission_with_queue(external_selection, &queue);
         #[cfg(not(target_os = "linux"))]
         self.external_frames.commit_after_submission();
         Ok(())
@@ -3268,6 +3364,8 @@ fn create_surface(
 
 #[cfg(test)]
 mod external_frame_tests {
+    #[cfg(target_os = "linux")]
+    use super::ExternalFrameSlot;
     use super::{ExternalFrameAcquisition, ExternalFrameOutcome, ExternalFrameState};
     #[cfg(target_os = "linux")]
     use super::{
@@ -3411,6 +3509,67 @@ mod external_frame_tests {
             Some(2),
         );
 
+        assert_eq!(state.displayed(), Some(&1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn matching_selection_prefers_latest_and_leaves_unrelated_latest_pending() {
+        let mut state = ExternalFrameState::default();
+        state.latest = Some(2);
+        state.displayed = Some(1);
+
+        assert_eq!(
+            state.select_matching(|frame| *frame == 1),
+            Some(ExternalFrameSlot::Displayed)
+        );
+        assert_eq!(
+            state.select_matching(|frame| *frame == 2),
+            Some(ExternalFrameSlot::Latest)
+        );
+        assert_eq!(state.select_matching(|frame| *frame == 3), None);
+        assert_eq!(state.latest(), Some(&2));
+        assert_eq!(state.displayed(), Some(&1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unmatched_scene_texture_schedules_no_external_barriers() {
+        let mut state = ExternalFrameState::default();
+        state.latest = Some(2);
+        state.displayed = Some(1);
+
+        assert_eq!(state.select_matching(|_| false), None);
+        assert_eq!(state.latest(), Some(&2));
+        assert_eq!(state.displayed(), Some(&1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_latest_submission_preserves_matching_displayed_frame() {
+        let mut state = ExternalFrameState::default();
+        state.stage(
+            wgpu::Backend::Vulkan,
+            ExternalFrameAcquisition::Prepared,
+            Some(1),
+        );
+        state.commit_after_submission();
+        state.stage(
+            wgpu::Backend::Vulkan,
+            ExternalFrameAcquisition::Prepared,
+            Some(2),
+        );
+        state.stage(
+            wgpu::Backend::Vulkan,
+            ExternalFrameAcquisition::FatalFailure,
+            None,
+        );
+
+        assert_eq!(
+            state.select_matching(|frame| *frame == 1),
+            Some(ExternalFrameSlot::Displayed)
+        );
+        assert_eq!(state.latest(), None);
         assert_eq!(state.displayed(), Some(&1));
     }
 
@@ -3942,7 +4101,7 @@ mod vulkan_external_frame_integration {
             let mut prepared = PreparedExternalFrame {
                 external_sync: Some(external_sync),
                 initial_state: wgpu::TextureUses::RESOURCE,
-                ownership: ExternalOwnership::External,
+                ownership: Some(ExternalOwnership::External),
                 texture: Arc::new(texture),
             };
 
@@ -4039,8 +4198,49 @@ mod vulkan_external_frame_integration {
             ]);
             prepared.on_submitted(&queue);
             assert!(prepared.external_sync.is_none());
+
+            device.poll(wgpu::PollType::wait_indefinitely())?;
+            assert!(completion_probe.load(Ordering::Acquire));
+
+            let mut held_acquire_encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("vulkan_external_frame_integration_held_acquire"),
+                });
+            let mut held_consumer_encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("vulkan_external_frame_integration_held_consumer"),
+                });
+            let mut held_release_encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("vulkan_external_frame_integration_held_release"),
+                });
+            assert_eq!(
+                prepared.encode_acquire_ownership(&mut held_acquire_encoder),
+                Ok(()),
+                "held Vulkan redraw must reacquire ownership without a new sync file"
+            );
+            {
+                let mut pass =
+                    held_consumer_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("vulkan_external_frame_integration_held_consumer"),
+                        timestamp_writes: None,
+                    });
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            assert_eq!(
+                prepared.encode_release_ownership(&mut held_release_encoder),
+                Ok(()),
+                "held Vulkan redraw must release ownership after sampling"
+            );
+            queue.submit([
+                held_acquire_encoder.finish(),
+                held_consumer_encoder.finish(),
+                held_release_encoder.finish(),
+            ]);
+            prepared.on_submitted(&queue);
             drop(prepared);
-            assert!(!completion_probe.load(Ordering::Acquire));
             assert!(!fallback_drop_probe.load(Ordering::Acquire));
         }
 
