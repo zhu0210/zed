@@ -1,11 +1,9 @@
 #[cfg(feature = "profiler")]
 use crate::DebugFrameOverlayMode;
-#[cfg(any(feature = "inspector", debug_assertions))]
-use crate::Inspector;
 #[cfg(feature = "profiler")]
 use crate::profiler;
-#[cfg(feature = "wgpu")]
-use crate::GpuContextHandle;
+#[cfg(all(target_os = "linux", feature = "wgpu"))]
+use crate::ExternalFrameRequest;
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
 use crate::{
@@ -28,8 +26,8 @@ use crate::{
     WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
     point, prelude::*, px, rems, size, transparent_black,
 };
-#[cfg(all(target_os = "linux", feature = "wgpu"))]
-use crate::{ExternalFrameOutcome, ExternalFrameRequest};
+#[cfg(feature = "wgpu")]
+use crate::{ExternalFrameOutcome, GpuContextHandle};
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
 use crate::interactive::TouchEvent;
@@ -6681,6 +6679,12 @@ impl Window {
     #[cfg(all(target_os = "linux", feature = "wgpu"))]
     pub fn take_external_frame_outcome(&self) -> Option<ExternalFrameOutcome> {
         self.platform_window.take_external_frame_outcome()
+    }
+
+    /// Clear pending and displayed external frames without submitting GPU work.
+    #[cfg(feature = "wgpu")]
+    pub fn clear_external_frame(&self) -> ExternalFrameOutcome {
+        self.platform_window.clear_external_frame()
     }
 
     /// Perform titlebar double-click action.

@@ -859,6 +859,11 @@ impl<T> Default for ExternalFrameState<T> {
 }
 
 impl<T> ExternalFrameState<T> {
+    fn clear(&mut self) {
+        self.latest = None;
+        self.displayed = None;
+    }
+
     fn stage(
         &mut self,
         backend: wgpu::Backend,
@@ -1100,6 +1105,19 @@ impl WgpuRenderer {
             .stage(self.adapter_info.backend, acquisition, frame);
         self.last_external_frame_outcome = Some(outcome);
         outcome
+    }
+
+    /// Clear pending and displayed external frames without submitting GPU work.
+    ///
+    /// Successful external draws already released the image to GENERAL and its
+    /// external queue family; their completion callback retains the texture and
+    /// producer lease. A never-submitted latest frame remains producer-owned, so
+    /// dropping it needs no barrier or submission.
+    #[cfg(target_os = "linux")]
+    pub fn clear_external_frame(&mut self) -> ExternalFrameOutcome {
+        self.external_frames.clear();
+        self.last_external_frame_outcome = Some(ExternalFrameOutcome::Accepted);
+        ExternalFrameOutcome::Accepted
     }
 
     /// Return the texture from the last accepted and presented external frame.
@@ -3512,6 +3530,18 @@ mod external_frame_tests {
         assert_eq!(state.displayed(), Some(&1));
     }
 
+    #[test]
+    fn clear_removes_displayed_and_never_submitted_latest_frames() {
+        let mut state = ExternalFrameState::default();
+        state.latest = Some(2);
+        state.displayed = Some(1);
+
+        state.clear();
+
+        assert_eq!(state.latest(), None);
+        assert_eq!(state.displayed(), None);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn matching_selection_prefers_latest_and_leaves_unrelated_latest_pending() {
@@ -3714,8 +3744,9 @@ mod external_frame_tests {
 #[cfg(all(test, target_os = "linux"))]
 mod vulkan_external_frame_integration {
     use super::{
-        EXTERNAL_SEMAPHORE_FD_EXTENSION, ExternalOwnership, PreparedExternalFrame,
-        VulkanExternalSync, WgpuContext, classify_external_sync_error,
+        EXTERNAL_SEMAPHORE_FD_EXTENSION, ExternalFrameState, ExternalOwnership,
+        PendingExternalFrame, PreparedExternalFrame, VulkanExternalSync, WgpuContext,
+        classify_external_sync_error,
     };
     use ash::{khr::external_semaphore_fd, vk};
     use std::os::fd::{FromRawFd, OwnedFd};
@@ -4240,7 +4271,11 @@ mod vulkan_external_frame_integration {
                 held_release_encoder.finish(),
             ]);
             prepared.on_submitted(&queue);
-            drop(prepared);
+            // Model clearing the displayed slot after submission. The completion callback keeps
+            // the texture and producer lease alive until the queued redraw finishes.
+            let mut displayed_state = ExternalFrameState::default();
+            displayed_state.displayed = Some(PendingExternalFrame::Prepared(prepared));
+            displayed_state.clear();
             assert!(!fallback_drop_probe.load(Ordering::Acquire));
         }
 

@@ -1962,6 +1962,11 @@ impl PlatformWindow for X11Window {
             .take_external_frame_outcome()
     }
 
+    #[cfg(target_os = "linux")]
+    fn clear_external_frame(&self) -> ExternalFrameOutcome {
+        self.0.state.borrow_mut().renderer.clear_external_frame()
+    }
+
     fn play_system_bell(&self) {
         // Volume 0% means don't increase or decrease from system volume
         let _ = self.0.xcb.bell(0);

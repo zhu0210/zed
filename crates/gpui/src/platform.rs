@@ -1052,6 +1052,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         None
     }
 
+    /// Clear pending and displayed external frames without submitting GPU work.
+    #[cfg(feature = "wgpu")]
+    fn clear_external_frame(&self) -> ExternalFrameOutcome {
+        ExternalFrameOutcome::Unsupported
+    }
+
     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
 
     // Mobile platform methods.

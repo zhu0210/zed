@@ -2119,6 +2119,11 @@ impl PlatformWindow for WaylandWindow {
         self.borrow_mut().renderer.take_external_frame_outcome()
     }
 
+    #[cfg(target_os = "linux")]
+    fn clear_external_frame(&self) -> ExternalFrameOutcome {
+        self.borrow_mut().renderer.clear_external_frame()
+    }
+
     fn play_system_bell(&self) {
         let state = self.borrow();
         let surface = if state.surface_state.toplevel().is_some() {
