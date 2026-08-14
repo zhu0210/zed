@@ -687,20 +687,23 @@ impl ExternalFrameState<PendingExternalFrame> {
         &mut self,
         slot: Option<ExternalFrameSlot>,
         queue: &wgpu::Queue,
-    ) {
+    ) -> bool {
         match slot {
             Some(ExternalFrameSlot::Latest) => {
-                if let Some(PendingExternalFrame::Prepared(mut frame)) = self.latest.take() {
-                    frame.on_submitted(queue);
-                    self.displayed = Some(PendingExternalFrame::Prepared(frame));
-                }
+                let Some(PendingExternalFrame::Prepared(mut frame)) = self.latest.take() else {
+                    return false;
+                };
+                frame.on_submitted(queue);
+                self.displayed = Some(PendingExternalFrame::Prepared(frame));
+                true
             }
             Some(ExternalFrameSlot::Displayed) => {
                 if let Some(PendingExternalFrame::Prepared(frame)) = self.displayed.as_mut() {
                     frame.on_submitted(queue);
                 }
+                false
             }
-            None => {}
+            None => false,
         }
     }
 }
@@ -901,10 +904,12 @@ impl<T> ExternalFrameState<T> {
     }
 
     #[cfg(any(test, not(target_os = "linux")))]
-    fn commit_after_submission(&mut self) {
-        if let Some(frame) = self.latest.take() {
-            self.displayed = Some(frame);
-        }
+    fn commit_after_submission(&mut self) -> bool {
+        let Some(frame) = self.latest.take() else {
+            return false;
+        };
+        self.displayed = Some(frame);
+        true
     }
 
     #[cfg(test)]
@@ -2491,8 +2496,10 @@ impl WgpuRenderer {
         #[cfg(not(target_os = "linux"))]
         queue.submit(std::iter::once(render_command_buffer));
         #[cfg(target_os = "linux")]
-        self.external_frames
-            .commit_after_submission_with_queue(external_selection, &queue);
+        if self.external_frames
+            .commit_after_submission_with_queue(external_selection, &queue) {
+            self.last_external_frame_outcome = Some(ExternalFrameOutcome::Accepted);
+        }
         #[cfg(not(target_os = "linux"))]
         self.external_frames.commit_after_submission();
         Ok(())
@@ -3461,10 +3468,65 @@ mod external_frame_tests {
             ExternalFrameOutcome::Accepted
         );
 
-        state.commit_after_submission();
+        assert!(state.commit_after_submission());
 
         assert_eq!(state.displayed(), Some(&2));
         assert_eq!(state.latest(), None);
+    }
+
+    #[test]
+    fn external_frame_stage_echoes_before_submission_certifies_promotion() {
+        let mut state = ExternalFrameState::default();
+
+        assert_eq!(
+            state.stage(
+                wgpu::Backend::Vulkan,
+                ExternalFrameAcquisition::Prepared,
+                Some(1),
+            ),
+            ExternalFrameOutcome::Accepted
+        );
+        assert_eq!(state.displayed(), None);
+        assert!(state.commit_after_submission());
+        assert!(!state.commit_after_submission());
+        assert_eq!(state.displayed(), Some(&1));
+    }
+
+    #[test]
+    fn failed_or_noncommitted_external_frame_does_not_certify_promotion() {
+        let mut state = ExternalFrameState::default();
+        assert_eq!(
+            state.stage(
+                wgpu::Backend::Vulkan,
+                ExternalFrameAcquisition::Prepared,
+                Some(1),
+            ),
+            ExternalFrameOutcome::Accepted
+        );
+        assert_eq!(
+            state.stage(
+                wgpu::Backend::Vulkan,
+                ExternalFrameAcquisition::TransientFailure,
+                None,
+            ),
+            ExternalFrameOutcome::TransientFailure
+        );
+        assert!(!state.commit_after_submission());
+        assert_eq!(state.displayed(), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_displayed_redraw_does_not_certify_promotion() {
+        let mut state = ExternalFrameState::default();
+        state.displayed = Some(1);
+
+        assert_eq!(
+            state.select_matching(|_| true),
+            Some(ExternalFrameSlot::Displayed)
+        );
+        assert!(!state.commit_after_submission());
+        assert_eq!(state.displayed(), Some(&1));
     }
 
     #[test]
@@ -3475,7 +3537,7 @@ mod external_frame_tests {
             ExternalFrameAcquisition::Prepared,
             Some(1),
         );
-        state.commit_after_submission();
+        assert!(state.commit_after_submission());
         state.stage(
             wgpu::Backend::Vulkan,
             ExternalFrameAcquisition::Prepared,
@@ -3490,7 +3552,7 @@ mod external_frame_tests {
             ),
             ExternalFrameOutcome::TransientFailure
         );
-        state.commit_after_submission();
+        assert!(!state.commit_after_submission());
         assert_eq!(state.displayed(), Some(&1));
 
         state.stage(
@@ -3506,7 +3568,7 @@ mod external_frame_tests {
             ),
             ExternalFrameOutcome::FatalFailure
         );
-        state.commit_after_submission();
+        assert!(!state.commit_after_submission());
 
         assert_eq!(state.displayed(), Some(&1));
         assert_eq!(state.latest(), None);
@@ -3520,7 +3582,7 @@ mod external_frame_tests {
             ExternalFrameAcquisition::Prepared,
             Some(1),
         );
-        state.commit_after_submission();
+        assert!(state.commit_after_submission());
         state.stage(
             wgpu::Backend::Vulkan,
             ExternalFrameAcquisition::Prepared,
@@ -3583,7 +3645,7 @@ mod external_frame_tests {
             ExternalFrameAcquisition::Prepared,
             Some(1),
         );
-        state.commit_after_submission();
+        assert!(state.commit_after_submission());
         state.stage(
             wgpu::Backend::Vulkan,
             ExternalFrameAcquisition::Prepared,
