@@ -1162,6 +1162,7 @@ impl<T> Default for ExternalFrameState<T> {
 }
 
 impl<T> ExternalFrameState<T> {
+    #[cfg(any(target_os = "linux", target_os = "android", test))]
     fn clear(&mut self) {
         self.latest = None;
         self.displayed = None;

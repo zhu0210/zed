@@ -18,7 +18,15 @@ fn embed_resource() {
     let rc_file = crate_dir.join("resources/windows/gpui.rc");
     println!("cargo:rerun-if-changed={}", manifest.display());
     println!("cargo:rerun-if-changed={}", rc_file.display());
-    embed_resource::compile(rc_file, embed_resource::ParamsIncludeDirs([crate_dir]))
+    // llvm-rc resolves resource filenames relative to its working directory,
+    // even when the preprocessor has an include directory.
+    let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("gpui.rc");
+    let manifest = manifest.to_string_lossy().replace('\\', "/");
+    let resource = std::fs::read_to_string(rc_file)
+        .unwrap()
+        .replace("resources/windows/gpui.manifest.xml", &manifest);
+    std::fs::write(&output, resource).unwrap();
+    embed_resource::compile(output, embed_resource::NONE)
         .manifest_required()
         .unwrap();
 }

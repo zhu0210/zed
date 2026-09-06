@@ -1,11 +1,11 @@
+#[cfg(feature = "wgpu-renderer")]
+use crate::wgpu_backend::wgpu_utils::RawWindow;
 use crate::{
     BoolExt, MacDisplay, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
     TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
     kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
     ns_string, renderer,
 };
-#[cfg(feature = "wgpu-renderer")]
-use crate::wgpu_backend::wgpu_utils::RawWindow;
 #[cfg(any(test, feature = "test-support"))]
 use anyhow::Result;
 use block::ConcreteBlock;
@@ -26,6 +26,8 @@ use cocoa::{
     },
 };
 use dispatch2::DispatchQueue;
+#[cfg(feature = "wgpu-renderer")]
+use gpui::DevicePixels;
 use gpui::{
     AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalDragPayload,
     ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers,
@@ -35,8 +37,6 @@ use gpui::{
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind,
     WindowParams, point, px, size,
 };
-#[cfg(feature = "wgpu-renderer")]
-use gpui::DevicePixels;
 #[cfg(feature = "wgpu-renderer")]
 use gpui_wgpu::WgpuSurfaceConfig;
 #[cfg(all(any(test, feature = "test-support"), not(feature = "wgpu-renderer")))]
@@ -1030,8 +1030,7 @@ impl MacWindow {
 
             #[cfg(feature = "wgpu-renderer")]
             let wgpu_config = {
-                let backing_rect: NSRect =
-                    msg_send![native_view, convertRectToBacking: bounds];
+                let backing_rect: NSRect = msg_send![native_view, convertRectToBacking: bounds];
                 let physical_size = size(
                     DevicePixels(backing_rect.size.width as i32),
                     DevicePixels(backing_rect.size.height as i32),

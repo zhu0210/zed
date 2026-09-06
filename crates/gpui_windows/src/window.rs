@@ -339,8 +339,7 @@ impl WindowsWindowInner {
             context.display,
             context.min_size,
             context.appearance,
-            #[cfg(not(feature = "wgpu-renderer"))]
-            context.disable_direct_composition,
+            context.draw_coordinator.clone(),
         )?;
 
         Ok(Rc::new(Self {

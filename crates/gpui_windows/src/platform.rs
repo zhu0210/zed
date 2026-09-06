@@ -125,6 +125,7 @@ impl WindowsPlatformState {
             jump_list: RefCell::new(jump_list),
             current_cursor: Cell::new(current_cursor),
             cursor_visible: Arc::new(AtomicBool::new(true)),
+            draw_coordinator: Rc::new(DrawCoordinator::new()),
             gpu_context: Rc::new(RefCell::new(None)),
             menus: RefCell::new(Vec::new()),
         }
@@ -189,7 +190,6 @@ impl WindowsPlatform {
             validation_number,
             main_sender: Some(main_sender),
             main_receiver: Some(main_receiver),
-            gpu_context: None,
             dispatcher: None,
         };
         let result = unsafe {
@@ -1037,8 +1037,7 @@ impl Platform for WindowsPlatform {
     #[cfg(feature = "wgpu-renderer")]
     fn gpu_context(&self) -> Option<gpui::WgpuContextHandle> {
         let gpu_ctx = self.inner.state.gpu_context.borrow();
-        let wgpu = gpu_ctx.as_ref()?.borrow();
-        let wgpu_ctx = wgpu.as_ref()?;
+        let wgpu_ctx = gpu_ctx.as_ref()?;
 
         wgpu_ctx.handle().ok()
     }
@@ -1052,9 +1051,7 @@ impl Platform for WindowsPlatform {
             );
         }
         drop(gpu_ctx);
-        *self.inner.state.gpu_context.borrow_mut() = Some(Rc::new(RefCell::new(Some(
-            WgpuContext::from_descriptor(descriptor),
-        ))));
+        *self.inner.state.gpu_context.borrow_mut() = Some(WgpuContext::from_descriptor(descriptor));
         Ok(())
     }
 }
@@ -1330,8 +1327,6 @@ struct PlatformWindowCreateContext {
     main_receiver: Option<PriorityQueueReceiver<RunnableVariant>>,
     #[cfg(not(feature = "wgpu-renderer"))]
     directx_devices: Option<DirectXDevices>,
-    #[cfg(feature = "wgpu-renderer")]
-    gpu_context: Option<GpuContext>,
     dispatcher: Option<Arc<WindowsDispatcher>>,
 }
 
