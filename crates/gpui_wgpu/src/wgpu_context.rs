@@ -356,6 +356,7 @@ impl WgpuContext {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("gpui_device"),
+                default_queue: wgpu::QueueDescriptor::default(),
                 required_features,
                 required_limits,
                 memory_hints: wgpu::MemoryHints::MemoryUsage,
@@ -476,6 +477,7 @@ impl WgpuContext {
 
         let descriptor = wgpu::DeviceDescriptor {
             label: Some("gpui_device"),
+            default_queue: wgpu::QueueDescriptor::default(),
             required_features,
             required_limits: required_limits.clone(),
             memory_hints: wgpu::MemoryHints::MemoryUsage,

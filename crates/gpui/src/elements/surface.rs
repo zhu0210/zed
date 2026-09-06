@@ -1,10 +1,10 @@
-#[cfg(feature = "wgpu")]
-use crate::{DevicePixels, Size};
 use crate::{
     Bounds, Element, ElementId, GlobalElementId, InspectorElementId, InteractiveElement,
     Interactivity, IntoElement, LayoutId, ObjectFit, Pixels, Style, StyleRefinement, Styled,
     Window,
 };
+#[cfg(feature = "wgpu")]
+use crate::{DevicePixels, Size};
 #[cfg(target_os = "macos")]
 use core_video::pixel_buffer::CVPixelBuffer;
 use refineable::Refineable;
@@ -23,11 +23,14 @@ use std::sync::Arc;
 pub struct Nv12ColorTransform {
     /// Column-major YUV-to-RGB matrix for an input `[Y, Cb, Cr, 1]` vector.
     pub yuv_to_rgb: [[f32; 4]; 4],
+    /// Encoded transfer function applied after the matrix conversion.
+    pub transfer: crate::VideoTransferFunction,
 }
 
 impl Default for Nv12ColorTransform {
     fn default() -> Self {
         Self {
+            transfer: crate::VideoTransferFunction::Srgb,
             yuv_to_rgb: [
                 [1.0000, 1.0000, 1.0000, 0.0],
                 [0.0000, -0.3441, 1.7720, 0.0],

@@ -224,7 +224,7 @@ impl SurfaceParams {
             bounds,
             content_mask,
             ycbcr_to_rgb: transform.yuv_to_rgb,
-            transfer: 0,
+            transfer: video_transfer_kind(transform.transfer),
             _padding: [0; 3],
         }
     }
@@ -571,6 +571,7 @@ impl PreparedExternalFrame {
                     hal_texture,
                     &texture_descriptor,
                     frame.initial_state,
+                    true, // Producer contents are initialized; do not clear imported video.
                 )
         };
 
@@ -1556,7 +1557,13 @@ impl WgpuRenderer {
             .iter()
             .find(|f| surface_caps.formats.contains(f))
             .copied()
-            .or_else(|| surface_caps.formats.iter().find(|f| !f.is_srgb()).copied())
+            .or_else(|| {
+                surface_caps
+                    .formats
+                    .iter()
+                    .find(|f| !f.has_srgb_suffix())
+                    .copied()
+            })
             .or_else(|| surface_caps.formats.first().copied())
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -2979,7 +2986,7 @@ impl WgpuRenderer {
                     cb_cr_texture,
                     matrix: gpui::VideoColorMatrix::Bt601,
                     range: gpui::VideoColorRange::Full,
-                    transfer: 0,
+                    transfer: video_transfer_kind(color_transform.transfer),
                     custom: Some(*color_transform),
                     multiplanar: false,
                 },
@@ -2992,7 +2999,7 @@ impl WgpuRenderer {
                     cb_cr_texture: texture,
                     matrix: gpui::VideoColorMatrix::Bt601,
                     range: gpui::VideoColorRange::Full,
-                    transfer: 0,
+                    transfer: video_transfer_kind(color_transform.transfer),
                     custom: Some(*color_transform),
                     multiplanar: true,
                 },
@@ -3034,6 +3041,7 @@ impl WgpuRenderer {
                     surface.bounds.into(),
                     surface.content_mask.bounds.into(),
                     gpui::Nv12ColorTransform {
+                        transfer: gpui::VideoTransferFunction::Srgb,
                         yuv_to_rgb: ycbcr_to_rgb,
                     },
                 )
@@ -4543,6 +4551,7 @@ mod vulkan_external_frame_integration {
                     hal_texture,
                     &texture_descriptor,
                     wgpu::TextureUses::RESOURCE,
+                    true, // The producer submission cleared this image before export.
                 )
             };
             let mut prepared = PreparedExternalFrame {
@@ -4851,6 +4860,7 @@ mod tests {
         );
 
         let transform = gpui::Nv12ColorTransform {
+            transfer: gpui::VideoTransferFunction::Srgb,
             yuv_to_rgb: [
                 [0.0, 1.0, 2.0, 3.0],
                 [4.0, 5.0, 6.0, 7.0],
@@ -4991,12 +5001,19 @@ mod normalized_surface_tests {
 
     #[test]
     fn bt601_limited_matrix_maps_reference_red() {
+        // Use unquantized BT.601 red; rounding to 8-bit codes introduces more
+        // error than this matrix arithmetic test permits.
         let conversion = ycbcr_to_rgb_matrix(
             gpui::VideoColorMatrix::Bt601,
             gpui::VideoColorRange::Limited,
         );
         assert_rgb_close(
-            apply_color_matrix(conversion, 81.0 / 255.0, 90.0 / 255.0, 240.0 / 255.0),
+            apply_color_matrix(
+                conversion,
+                (16.0 + 219.0 * 0.299) / 255.0,
+                0.5 - (224.0 / 255.0) * 0.299 / (2.0 * (1.0 - 0.114)),
+                0.5 + (224.0 / 255.0) * 0.5,
+            ),
             [1.0, 0.0, 0.0],
         );
     }
