@@ -34,6 +34,7 @@ pub(crate) struct WebWindowCallbacks {
 
 pub(crate) struct WebWindowMutableState {
     pub(crate) renderer: WgpuRenderer,
+    gpu_context: gpui::WgpuContextHandle,
     pub(crate) bounds: Bounds<Pixels>,
     pub(crate) scale_factor: f32,
     pub(crate) max_texture_dimension: u32,
@@ -164,6 +165,7 @@ impl WebWindow {
             transparent: false,
             preferred_present_mode: None,
         };
+        let gpu_context = context.handle()?;
         let renderer = WgpuRenderer::new_from_surface(context, surface, renderer_config)?;
 
         let ime_mirror = ImeMirror::new(&document, &body)?;
@@ -177,6 +179,7 @@ impl WebWindow {
 
         let mutable_state = WebWindowMutableState {
             renderer,
+            gpu_context,
             bounds: initial_bounds,
             scale_factor: dpr,
             max_texture_dimension,
@@ -844,6 +847,10 @@ impl PlatformWindow for WebWindow {
             .borrow()
             .renderer
             .supports_dual_source_blending()
+    }
+
+    fn gpu_context(&self) -> Option<gpui::WgpuContextHandle> {
+        Some(self.inner.state.borrow().gpu_context.clone())
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {

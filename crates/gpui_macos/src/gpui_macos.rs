@@ -14,8 +14,6 @@ mod system_notifications;
 #[cfg(feature = "wgpu-renderer")]
 mod wgpu_backend;
 
-#[cfg(not(feature = "wgpu-renderer"))]
-pub mod metal_renderer;
 #[cfg(feature = "screen-capture")]
 mod screen_capture;
 
@@ -38,8 +36,8 @@ mod open_type;
 mod text_system;
 
 mod platform;
-mod window_appearance;
 mod window;
+mod window_appearance;
 
 use cocoa::{
     base::{id, nil},
