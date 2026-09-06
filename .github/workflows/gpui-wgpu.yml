@@ -5,6 +5,8 @@ on:
     branches: [gpui_wgpu_backend]
   pull_request:
     branches: [gpui_wgpu_backend]
+env:
+  RUSTUP_TOOLCHAIN: stable
 permissions:
   contents: read
 concurrency:
