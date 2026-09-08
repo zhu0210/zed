@@ -425,10 +425,13 @@ impl WgpuContext {
                 return Ok(None);
             }
         }
+        // This storage must outlive the callback AND vkCreateDevice: HAL invokes
+        // the callback first, then builds its final create-info chain afterward.
         #[cfg(target_os = "android")]
-        let ycbcr_enabled = std::cell::Cell::new(false);
+        let mut ycbcr_features = ash::vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default()
+            .sampler_ycbcr_conversion(true);
         #[cfg(target_os = "android")]
-        let enabled = &ycbcr_enabled;
+        let ycbcr_features = &mut ycbcr_features;
         let callback: Box<wgpu::hal::vulkan::CreateDeviceCallback<'_>> = Box::new(move |args| {
             #[cfg(target_os = "linux")]
             if !args.extensions.contains(&EXTERNAL_SEMAPHORE_FD_EXTENSION) {
@@ -443,16 +446,10 @@ impl WgpuContext {
                 if !args.extensions.contains(&extension) {
                     args.extensions.push(extension);
                 }
-                // HAL exposes features through its normal Vulkan create chain.
-                // Enable the advertised bit and detach the temporary chain so
-                // HAL can build its final chain without linking nodes twice.
-                let info = args
-                    .device_features
-                    .add_to_device_create(ash::vk::DeviceCreateInfo::default());
-                // SAFETY: these nodes originate from the exclusive mutable
-                // device_features borrow. The callback is synchronous; no
-                // consumer holds references to the temporary chain.
-                enabled.set(unsafe { enable_android_ycbcr_and_detach(info.p_next) });
+                // HAL tracks this feature internally but does not add it to its
+                // device feature chain. Use the supported callback pNext extension
+                // point; HAL preserves it while appending its own requested features.
+                *args.create_info = std::mem::take(args.create_info).push_next(ycbcr_features);
             }
         });
 
@@ -468,12 +465,6 @@ impl WgpuContext {
                 )
                 .map_err(|error| anyhow::anyhow!("opening Vulkan HAL device: {error:?}"))?
         };
-
-        #[cfg(target_os = "android")]
-        anyhow::ensure!(
-            ycbcr_enabled.get(),
-            "HAL did not expose samplerYcbcrConversion features"
-        );
 
         let descriptor = wgpu::DeviceDescriptor {
             label: Some("gpui_device"),
@@ -910,46 +901,47 @@ mod tests {
     }
 }
 
-#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
-unsafe fn enable_android_ycbcr_and_detach(chain: *const std::ffi::c_void) -> bool {
-    use ash::vk;
-    let mut node = chain as *mut vk::BaseOutStructure<'_>;
-    let mut enabled = false;
-    // SAFETY: caller exclusively owns this finite mutable Vulkan feature chain.
-    // Detach every node after saving its successor, preserving all feature values
-    // except the supported samplerYcbcrConversion bit that this helper enables.
-    unsafe {
-        while let Some(header) = node.as_mut() {
-            let next = header.p_next;
-            if header.s_type == vk::StructureType::PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES
-            {
-                (*node.cast::<vk::PhysicalDeviceSamplerYcbcrConversionFeatures<'_>>())
-                    .sampler_ycbcr_conversion = vk::TRUE;
-                enabled = true;
-            }
-            header.p_next = std::ptr::null_mut();
-            node = next;
-        }
-    }
-    enabled
-}
-
 #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod android_feature_tests {
     #[test]
-    fn enables_ycbcr_without_corrupting_other_features_or_relinking_nodes() {
+    fn hal_preserves_external_ycbcr_feature_node_in_final_device_chain() {
         use ash::vk;
-        let mut ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default();
+        // Reproduce the HAL case where its own feature chain has no YCbCr node.
+        let mut hal_features = wgpu::hal::vulkan::PhysicalDeviceFeatures::default();
+        let mut ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default()
+            .sampler_ycbcr_conversion(true);
         let mut timeline =
             vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
-        let info = vk::DeviceCreateInfo::default()
-            .push_next(&mut ycbcr)
-            .push_next(&mut timeline);
-        // SAFETY: both nodes are exclusively owned by this test until the call returns.
-        assert!(unsafe { super::enable_android_ycbcr_and_detach(info.p_next) });
-        assert_eq!(ycbcr.sampler_ycbcr_conversion, vk::TRUE);
-        assert_eq!(timeline.timeline_semaphore, vk::TRUE);
-        assert!(ycbcr.p_next.is_null());
-        assert!(timeline.p_next.is_null());
+        let callback_info = vk::DeviceCreateInfo::default()
+            .push_next(&mut timeline)
+            .push_next(&mut ycbcr);
+        let final_info = hal_features.add_to_device_create(callback_info);
+        let mut node = final_info.p_next.cast::<vk::BaseInStructure<'_>>();
+        let mut ycbcr_count = 0;
+        let mut timeline_count = 0;
+        // SAFETY: both feature nodes and HAL storage are alive and exclusively
+        // borrowed by final_info. This only reads the finite chain during that borrow.
+        unsafe {
+            while let Some(header) = node.as_ref() {
+                match header.s_type {
+                    vk::StructureType::PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES => {
+                        let feature =
+                            &*node.cast::<vk::PhysicalDeviceSamplerYcbcrConversionFeatures<'_>>();
+                        assert_eq!(feature.sampler_ycbcr_conversion, vk::TRUE);
+                        ycbcr_count += 1;
+                    }
+                    vk::StructureType::PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES => {
+                        let feature =
+                            &*node.cast::<vk::PhysicalDeviceTimelineSemaphoreFeatures<'_>>();
+                        assert_eq!(feature.timeline_semaphore, vk::TRUE);
+                        timeline_count += 1;
+                    }
+                    _ => {}
+                }
+                node = header.p_next;
+            }
+        }
+        assert_eq!(ycbcr_count, 1);
+        assert_eq!(timeline_count, 1);
     }
 }
