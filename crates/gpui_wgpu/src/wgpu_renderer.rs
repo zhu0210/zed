@@ -748,7 +748,7 @@ enum PendingExternalFrame {
     Prepared(PreparedExternalFrame),
     #[cfg(any(target_os = "linux", target_os = "android"))]
     Rgba {
-        commands: Option<wgpu::CommandBuffer>,
+        commands: Option<Vec<wgpu::CommandBuffer>>,
         texture: Arc<wgpu::Texture>,
     },
     #[cfg(target_os = "linux")]
@@ -899,7 +899,7 @@ impl ExternalFrameState<PendingExternalFrame> {
     fn take_rgba_commands(
         &mut self,
         slot: Option<ExternalFrameSlot>,
-    ) -> Option<wgpu::CommandBuffer> {
+    ) -> Option<Vec<wgpu::CommandBuffer>> {
         match self.selected_mut(slot?)? {
             PendingExternalFrame::Rgba { commands, .. } => commands.take(),
             _ => None,
@@ -2835,6 +2835,7 @@ impl WgpuRenderer {
             queue.submit(
                 conversion_commands
                     .into_iter()
+                    .flatten()
                     .chain(std::iter::once(render_command_buffer)),
             );
         }
@@ -2842,6 +2843,7 @@ impl WgpuRenderer {
         queue.submit(
             conversion_commands
                 .into_iter()
+                .flatten()
                 .chain(std::iter::once(render_command_buffer)),
         );
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -3732,7 +3734,10 @@ mod external_frame_tests {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         }));
         let view = texture.create_view(&Default::default());
@@ -3749,10 +3754,113 @@ mod external_frame_tests {
             })],
             ..Default::default()
         }));
+        encoder.transition_resources(
+            std::iter::empty(),
+            std::iter::once(wgpu::TextureTransition {
+                texture: texture.as_ref(),
+                selector: None,
+                state: wgpu::TextureUses::RESOURCE,
+            }),
+        );
         // SAFETY: both resources belong to device; the tracked render pass writes
         // this texture and wgpu retains its resources through GPU completion.
         let frame = unsafe { gpui::ExternalRgbaFrame::new(texture, encoder.finish()) }?;
+        let (texture, mut commands) = frame.into_parts();
+        assert_eq!(commands.len(), 1); // the single-buffer constructor remains usable
+        let mut raw_encoder = device.create_command_encoder(&Default::default());
+        // SAFETY: this encoder records only raw Vulkan commands on device's queue.
+        // The first buffer initializes the texture and leaves it in RESOURCE;
+        // this buffer writes red and restores that layout before normal wgpu use.
+        // Its completion callback retains the texture independently of scene life.
+        unsafe {
+            let hal_device = device
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .ok_or_else(|| anyhow::anyhow!("missing Vulkan device"))?;
+            let hal_texture = texture
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .ok_or_else(|| anyhow::anyhow!("missing Vulkan texture"))?;
+            let image = hal_texture.raw_handle();
+            let raw = hal_device.raw_device();
+            raw_encoder.as_hal_mut::<wgpu::hal::api::Vulkan, _, _>(|encoder| {
+                let encoder = encoder.ok_or_else(|| anyhow::anyhow!("missing raw encoder"))?;
+                let command = encoder.raw_handle();
+                let range = ash::vk::ImageSubresourceRange::default()
+                    .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                    .level_count(1)
+                    .layer_count(1);
+                let barrier = ash::vk::ImageMemoryBarrier::default()
+                    .image(image)
+                    .subresource_range(range)
+                    .src_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
+                    .old_layout(ash::vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .new_layout(ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_access_mask(
+                        ash::vk::AccessFlags::MEMORY_READ | ash::vk::AccessFlags::MEMORY_WRITE,
+                    )
+                    .dst_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE);
+                raw.cmd_pipeline_barrier(
+                    command,
+                    ash::vk::PipelineStageFlags::ALL_COMMANDS,
+                    ash::vk::PipelineStageFlags::TRANSFER,
+                    ash::vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier],
+                );
+                raw.cmd_clear_color_image(
+                    command,
+                    image,
+                    ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &ash::vk::ClearColorValue {
+                        float32: [1.0, 0.0, 0.0, 1.0],
+                    },
+                    &[range],
+                );
+                let barrier = barrier
+                    .old_layout(ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(ash::vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(ash::vk::AccessFlags::MEMORY_READ);
+                raw.cmd_pipeline_barrier(
+                    command,
+                    ash::vk::PipelineStageFlags::TRANSFER,
+                    ash::vk::PipelineStageFlags::ALL_COMMANDS,
+                    ash::vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier],
+                );
+                Ok::<_, anyhow::Error>(())
+            })?;
+        }
+        let retained_texture = texture.clone();
+        raw_encoder.on_submitted_work_done(move || drop(retained_texture));
+        commands.push(raw_encoder.finish());
+        // SAFETY: the ordered buffers initialize, write, and retain the same
+        // device texture, with all raw transitions restored before sampling.
+        let frame = unsafe { gpui::ExternalRgbaFrame::new_with_commands(texture, commands) }?;
         let (texture, commands) = frame.into_parts();
+        assert_eq!(commands.len(), 2);
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("prepared RGBA readback"),
+            size: 512,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut readback_encoder = device.create_command_encoder(&Default::default());
+        readback_encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(2),
+                },
+            },
+            texture.size(),
+        );
         let mut state = ExternalFrameState::default();
         state.latest = Some(super::PendingExternalFrame::Rgba {
             texture: texture.clone(),
@@ -3790,12 +3898,34 @@ mod external_frame_tests {
         let selection = state.selection_for_scene(&scene, (2, 2));
         assert_eq!(selection, Some(super::ExternalFrameSlot::Latest));
         assert!(state.displayed().is_none());
-        queue.submit(state.take_rgba_commands(selection));
+        queue.submit(
+            state
+                .take_rgba_commands(selection)
+                .into_iter()
+                .flatten()
+                .chain(std::iter::once(readback_encoder.finish())),
+        );
         assert!(state.commit_after_submission_with_queue(selection, &queue));
         let selection = state.selection_for_scene(&scene, (2, 2));
         assert_eq!(selection, Some(super::ExternalFrameSlot::Displayed));
         assert!(state.take_rgba_commands(selection).is_none());
         assert!(!state.commit_after_submission_with_queue(selection, &queue));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                sender
+                    .send(result)
+                    .expect("readback receiver remains alive");
+            });
+        device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(std::time::Duration::from_secs(5)),
+        })?;
+        receiver.recv_timeout(std::time::Duration::from_secs(5))??;
+        let pixels = readback.slice(..).get_mapped_range()?;
+        assert_eq!(&pixels[0..8], &[255, 0, 0, 255, 255, 0, 0, 255]);
+        assert_eq!(&pixels[256..264], &[255, 0, 0, 255, 255, 0, 0, 255]);
         Ok(())
     }
 

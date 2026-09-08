@@ -1973,7 +1973,7 @@ impl ExternalNv12Frame {
 #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "wgpu"))]
 pub struct ExternalRgbaFrame {
     // Drop unsubmitted commands before their output texture.
-    commands: wgpu::CommandBuffer,
+    commands: Vec<wgpu::CommandBuffer>,
     texture: Arc<wgpu::Texture>,
 }
 
@@ -1991,6 +1991,26 @@ impl ExternalRgbaFrame {
         texture: Arc<wgpu::Texture>,
         commands: wgpu::CommandBuffer,
     ) -> anyhow::Result<Self> {
+        // SAFETY: the caller supplies the same device/lifetime/synchronization
+        // guarantees required by the ordered command-buffer constructor.
+        unsafe { Self::new_with_commands(texture, vec![commands]) }
+    }
+
+    /// Validate conversion work whose command buffers execute in the given order.
+    /// Separate buffers allow wgpu initialization and raw native recording without
+    /// mixing those APIs on one encoder.
+    ///
+    /// # Safety
+    /// The requirements of [`Self::new`] apply to the complete ordered sequence.
+    /// Every buffer must retain its resources until its own GPU work completes.
+    pub unsafe fn new_with_commands(
+        texture: Arc<wgpu::Texture>,
+        commands: Vec<wgpu::CommandBuffer>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !commands.is_empty(),
+            "prepared RGBA frame requires conversion commands"
+        );
         anyhow::ensure!(
             matches!(
                 texture.format(),
@@ -2016,7 +2036,7 @@ impl ExternalRgbaFrame {
     }
 
     /// Consume the prepared work and its GPU-tracked output.
-    pub fn into_parts(self) -> (Arc<wgpu::Texture>, wgpu::CommandBuffer) {
+    pub fn into_parts(self) -> (Arc<wgpu::Texture>, Vec<wgpu::CommandBuffer>) {
         (self.texture, self.commands)
     }
 }
